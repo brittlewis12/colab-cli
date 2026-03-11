@@ -1,0 +1,1168 @@
+# colab: Design Document
+
+## Overview
+
+A TypeScript CLI that lets AI coding agents execute Python code on Google Colab GPU runtimes. Not an MCP server — a plain CLI that agents call via bash. Notebook-centric, agent-first, non-interactive.
+
+**Runtime**: Bun
+**Language**: TypeScript (no Python runtime dependency)
+**Binary**: `colab`
+
+---
+
+## 1. Design Principles
+
+### P1: The Notebook Is the Object
+
+Colab's actual abstraction is a notebook with a 1:1 runtime. We match that — no separate "VM" concept exposed. `colab ensure training --gpu t4` creates a notebook named "training" backed by a T4 runtime. The notebook is the unit of lifecycle, execution, and file management.
+
+### P2: Explicit Lifecycle, No Defaults for Expensive Things
+
+`ensure` not `open`. No default GPU type — the agent must say `--gpu t4` or `--gpu a100` explicitly. GPU allocation costs real money and real time. Making it explicit prevents agents from accidentally burning compute units.
+
+### P3: Remote Is Source of Truth
+
+The .ipynb on Colab is canonical. Colab notebooks persist on Google Drive — they survive runtime reclamation. The runtime is just the ephemeral compute layer; the notebook itself lives beyond it.
+
+The local .py is a working copy for editing. The local `.colab/notebooks/<name>.ipynb` cache is a safety net — updated on every `pull` and `push` — covering the gap between what's on the runtime's working copy and what's been synced to Drive. If anything goes wrong, the local cache plus the .py give you full recovery.
+
+### P4: Git-Like Pull/Push Workflow
+
+`pull` downloads the remote .ipynb and converts to a local .py for editing. `push` converts the .py back to .ipynb, merging to preserve cell IDs and outputs, and uploads. This separates editing from execution and makes the flow explicit.
+
+### P5: State Always Visible
+
+Every command that mutates state returns the new state. No fire-and-forget. `ensure` returns the full notebook status. `push` reports what changed. `run` streams outputs and returns results.
+
+### P6: Idempotent by Default
+
+`ensure` is get-or-create. Running it twice with the same args is a no-op. `push` when nothing changed is a no-op (content hash comparison). Agents can safely retry.
+
+### P7: Cost-Awareness First-Class
+
+Quota and compute-unit info surfaced in `ensure` output and `status`. Never let an agent burn units without visibility.
+
+### P8: Non-Interactive Always
+
+No prompts, no confirmations, no interactive input. Every operation is a single command with a deterministic result.
+
+### P9: Actionable Errors with Recovery Hints
+
+Every error includes: what happened, why, and the exact command to fix it.
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "QUOTA_EXCEEDED",
+    "message": "No compute units remaining for T4 GPU",
+    "hint": "colab ensure training --gpu none  # use CPU runtime instead"
+  }
+}
+```
+
+### P10: Token Refresh Invisible
+
+OAuth access tokens, proxy tokens, XSRF tokens — all refreshed automatically. The agent never sees auth plumbing.
+
+---
+
+## 2. Core Concepts
+
+### Notebook = Name + Runtime + Kernel + Local Working Copy
+
+A notebook named `training` maps to:
+
+| Concept | Concrete thing |
+|---|---|
+| Identity | The name `training` |
+| Remote state | A Colab .ipynb with a notebookHash |
+| Compute | A runtime (VM) assigned to that notebook |
+| Execution | A kernel running on that runtime |
+| Local working copy | `training.py` (percent format) in the project directory |
+| Local metadata | `.colab/notebooks/training.json` |
+| Local cache | `.colab/notebooks/training.ipynb` (last known remote) |
+
+This 1:1 mapping matches how Colab actually works. Each Colab notebook has exactly one runtime. We don't invent a separate VM abstraction.
+
+### Names, Not Paths
+
+Notebooks are referenced by name: `training`, `experiment-1`, `data-prep`. Never by file path or extension. The agent says `colab run training`, not `colab run training.ipynb` or `colab run ./training.py`. The name is the stable identifier across all commands.
+
+### The .py File Is for Editing, Not Executing
+
+The local .py (percent format) exists so agents can read and edit notebook source using standard file tools. It is not meant to be executed locally. The .ipynb on the remote runtime is what actually runs.
+
+---
+
+## 3. CLI Surface
+
+### Auth
+
+```
+colab auth login          # OAuth2 flow (opens browser), stores tokens
+colab auth status         # Auth state, email, tier, token expiry, quota
+colab auth logout         # Revoke tokens, delete stored credentials
+```
+
+### Notebook Lifecycle
+
+```
+colab ensure <name> --gpu <type>   # Get-or-create notebook + runtime (blocks until ready)
+colab ls                           # List all notebooks/runtimes
+colab status [<name>]              # Overview (no arg) or notebook details
+colab kill <name>                  # Teardown runtime, preserve local .py
+```
+
+### Notebook Workflow
+
+```
+colab pull <name>                  # Download .ipynb, convert to .py
+colab push <name>                  # Convert .py to .ipynb (merge), upload
+colab diff <name>                  # Cell-level diff: local .py vs remote .ipynb
+```
+
+### Execution
+
+```
+colab run <name>                   # Execute all cells
+colab run <name> --cell <ref>      # Execute specific cell(s)
+colab run <name> --push            # Push first, then run
+```
+
+### Escape Hatches
+
+```
+colab exec <name> "<code>"         # Execute ad-hoc Python on the runtime
+colab restart <name>               # Restart kernel (preserve runtime)
+colab interrupt <name>             # Cancel running execution
+```
+
+### File Transfer (via Contents API)
+
+```
+colab upload <name> <local> <remote>    # Upload file to runtime
+colab download <name> <remote> <local>  # Download file from runtime
+```
+
+---
+
+## 4. Command Details
+
+### `colab ensure <name> --gpu <type>`
+
+Get-or-create a notebook with a runtime. Idempotent. Blocks until ready.
+
+**Logic**:
+1. Check `.colab/notebooks/<name>.json` for existing notebook
+2. If found AND specs match → verify runtime still alive via `listAssignments()`
+   - If alive → refresh proxy token if needed → return
+   - If dead (reclaimed) → clean up stale state, fall through to step 4
+3. If found AND specs don't match → error with hint to kill first
+4. If not found → generate notebookHash → `assign(hash, {accelerator})` → poll until assigned → `refreshConnection()` for proxy token → create empty .ipynb on runtime via Contents API → write local state → return
+
+**First-run behavior**: `ensure` creates an empty .ipynb on the runtime (one empty code cell, `python3` kernelspec). This means `pull` immediately after `ensure` gives a minimal .py file. The agent can also skip `pull` and write a .py from scratch — `push` handles the "no prior pull" case (see push logic).
+
+**Reclamation recovery**: When `ensure` finds stale state pointing to a dead runtime, it creates a fresh runtime. The `notebookHash` is regenerated (it's random, not derived from the name). Stale fields are cleared — `remoteModifiedAt` is reset to null so the next `push` doesn't false-conflict against the dead runtime's timestamps. The next `push` restores the notebook from the local .ipynb cache.
+
+**Flags**:
+
+| Flag | Type | Required | Description |
+|---|---|---|---|
+| `<name>` | positional | yes | Notebook name |
+| `--gpu` | enum | yes | `none`, `t4`, `l4`, `v100`, `a100` |
+| `--high-mem` | bool | no | High-memory VM variant |
+| `--ttl` | duration | no, default `2h` | Auto-kill after duration. `0` = no TTL |
+| `--timeout` | seconds | no, default `120` | Max wait for assignment |
+
+No default GPU. The agent must be explicit about what it needs.
+
+**Exit codes**: 0 = ready, 4 = auth error, 5 = quota exceeded, 6 = timeout
+
+### `colab pull <name>`
+
+Download the remote .ipynb and convert to a local .py file.
+
+**Logic**:
+1. Fetch .ipynb from runtime via Contents API
+2. Convert .ipynb to percent-format .py (see Section 6)
+3. Write `<name>.py` to project directory
+4. Cache .ipynb to `.colab/notebooks/<name>.ipynb`
+5. Update state: content hash of .py (`pushedHash`), `remoteModifiedAt` from Contents API response
+
+**Safety**: If local .py exists and has unpushed changes (dirty), error with hint: `colab push <name>` first, or `colab pull <name> --force` to overwrite. If `<name>.py` doesn't exist yet, no conflict possible — just write it.
+
+**Flags**:
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--force` | bool | false | Overwrite local .py even if dirty |
+
+### `colab push <name>`
+
+Convert local .py to .ipynb, merge with remote, and upload.
+
+**Logic**:
+1. Read local `<name>.py`, parse into cells
+2. Resolve merge base:
+   - Try fetching current remote .ipynb via Contents API (implicit rebase)
+   - If remote exists → use as merge base, run conflict detection (see below)
+   - If remote doesn't exist → fall back to local `.colab/notebooks/<name>.ipynb` cache
+   - If no cache either → no merge base (fresh notebook: all cells get fresh UUIDs, empty outputs)
+3. If merge base exists: content-addressed merge — local cells + merge base → merged .ipynb (see Section 7). If no merge base: build .ipynb from local cells directly.
+4. Upload .ipynb via Contents API
+5. Update local state: cached .ipynb, content hash (`pushedHash`), `remoteModifiedAt` from Contents API response
+
+**Conflict detection**: The Contents API `GET /api/contents/{path}` returns a `last_modified` field. On every `pull` and `push`, we store this as `remoteModifiedAt` in `.colab/notebooks/<name>.json`. On push, compare the remote's current `last_modified` to our stored `remoteModifiedAt`. If they differ (remote changed since we last synced), error unless `--force`. On first push (no stored timestamp), skip conflict detection — there's nothing to conflict with.
+
+**Push-without-pull**: Works. If the agent writes `training.py` from scratch and pushes without ever pulling, push creates the .ipynb from the .py cells with fresh UUIDs and empty outputs. This is the simplest path for agents that don't need to inspect an existing notebook.
+
+**Flags**:
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--force` | bool | false | Skip conflict detection |
+
+**Safety**: `push --force` skips conflict detection. The merge still preserves outputs where possible.
+
+### `colab run <name>`
+
+Execute cells of the notebook on its runtime.
+
+**Logic**:
+1. Connect to kernel via WebSocket (see Section 10)
+2. If `--push` flag: push first
+3. If no `--push` and local is dirty: warn (stderr) but proceed (runs remote version)
+4. Execute cells: all cells, or specific cells via `--cell`
+5. Stream outputs as they arrive
+6. Return collected results
+
+**Cell addressing** (`--cell <ref>`):
+- Integer: cell index (0-based)
+- String matching a cell title from `# %% <title>`: label-based
+- Cell ID (from .ipynb): ID-based
+- Resolution order: try integer parse, then title match, then ID match
+
+**Flags**:
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--cell` | string | (all cells) | Cell reference (index, title, or ID) |
+| `--push` | bool | false | Push local changes before running |
+| `--timeout` | seconds | 300 | Max execution time per cell |
+
+### `colab exec <name> "<code>"`
+
+Execute ad-hoc Python on a notebook's runtime. This is the escape hatch for debugging, inspection, and one-off commands that don't belong in the notebook.
+
+**Design**: Code runs on the same kernel as `colab run`, so variables and imports are shared. But the code is not saved to the notebook — it's ephemeral.
+
+### `colab diff <name>`
+
+Show cell-level diff between local .py and remote .ipynb.
+
+**Logic**:
+1. Parse local .py into cells
+2. Fetch remote .ipynb
+3. Run the content-addressed matching algorithm (same as merge)
+4. Display: added cells, deleted cells, modified cells (with source diff)
+
+### `colab restart <name>`
+
+Restart the kernel without killing the runtime. Clears all Python state (variables, imports) but preserves the runtime (GPU, installed packages via pip).
+
+### `colab interrupt <name>`
+
+Send interrupt signal to the kernel, cancelling any running execution. Useful when an agent starts a long-running cell and needs to bail.
+
+### `colab ls`
+
+List all known notebooks and their runtime status.
+
+**Logic**:
+1. Read all `.colab/notebooks/<name>.json` files (local state)
+2. Call `listAssignments()` to get live runtime status
+3. Merge: match local state to remote assignments by endpoint
+4. Display: name, gpu, runtime status (running/dead/unknown), last activity
+
+Notebooks with local state but dead runtimes show as "stopped." Remote assignments with no local state are listed as "unmanaged" (created in Colab web UI).
+
+### `colab status [<name>]`
+
+**No argument**: Combined dashboard — auth state, quota, all notebooks (same as `ls` but with quota info).
+
+**With argument**: Detailed status for one notebook — runtime state, gpu, kernel status, dirty state, last push/pull timestamps, TTL remaining. Sends keep-alive as side effect.
+
+### `colab upload <name> <local> <remote>`
+
+Upload a local file to the notebook's runtime via Contents API.
+
+**Logic**:
+1. Read local file, base64-encode if binary
+2. `PUT /api/contents/<remote>` with file content
+3. Report bytes transferred
+
+Remote paths are relative to `/content/` (the runtime's working directory). So `colab upload training data.csv data.csv` uploads to `/content/data.csv`.
+
+### `colab download <name> <remote> <local>`
+
+Download a file from the notebook's runtime via Contents API.
+
+**Logic**:
+1. `GET /api/contents/<remote>` — returns content (base64 for binary)
+2. Decode and write to local path
+3. Report bytes transferred
+
+---
+
+### Project Root Discovery
+
+The CLI finds the project root (where `.colab/` lives) by walking up from CWD, looking for `.colab/`. If not found, CWD is the project root (and `.colab/` is created on first `ensure`). This matches git's directory discovery behavior.
+
+The `.py` working copies are written relative to the project root, not CWD. So `colab pull training` always writes `<project_root>/training.py` regardless of where in the project tree you invoke it.
+
+---
+
+## 5. Notebook Workflow
+
+The core loop for agents:
+
+```
+ensure → pull → edit → push → run → pull (to see outputs)
+```
+
+### Detailed Flow
+
+```
+1. colab ensure training --gpu t4
+   → Runtime allocated, notebook created
+   → .colab/notebooks/training.json written
+
+2. colab pull training
+   → .ipynb downloaded from runtime
+   → Converted to training.py (percent format)
+   → .colab/notebooks/training.ipynb cached
+
+3. Agent edits training.py
+   → Standard file editing (read, write, edit tools)
+   → The .py is a normal Python file with # %% cell markers
+
+4. colab push training
+   → training.py parsed into cells
+   → Fetches fresh remote .ipynb (implicit rebase)
+   → Content-addressed merge preserves cell IDs + outputs
+   → Merged .ipynb uploaded to runtime
+
+5. colab run training
+   → Executes all cells on the runtime
+   → Outputs streamed to terminal
+   → Results returned (stdout, results, errors)
+
+6. colab pull training
+   → Updated .ipynb (now with outputs) downloaded
+   → Agent can inspect outputs in training.py context
+```
+
+### Shortcuts
+
+**`run --push`**: Steps 4+5 combined. Push then run. The most common agent pattern after editing.
+
+**First time**: `ensure` + `pull` on a new notebook pulls an empty notebook (one empty code cell). Agent adds content, pushes, runs.
+
+**Inspection loop**: After `run`, agent can `pull` to see outputs embedded in the .ipynb (cached locally), or use `colab exec training "print(result)"` for quick checks.
+
+---
+
+## 6. Percent-Format Conversion
+
+We implement jupytext's percent format in TypeScript — not a port of jupytext, but a compatible subset built for our specific use case.
+
+### Why Not Ship jupytext as a Dependency
+
+- No Python in the toolchain. The tool is Bun + TypeScript only.
+- jupytext is a large Python package with its own dependency tree.
+- We need a narrow slice of its functionality.
+
+### Surface Area
+
+Three core functions:
+
+**`ipynbToPercent(notebook) → string`** — used by `pull`
+- Serialize YAML front-matter (kernelspec, notebook metadata)
+- Walk cells array
+- Code cells: `# %%\n` + source (with magic commenting)
+- Markdown cells: `# %% [markdown]\n` + comment-prefixed lines
+- Raw cells: `# %% [raw]\n` + comment-prefixed lines
+- PEP 8 blank line spacing between cells
+
+**`percentToCells(text) → Cell[]`** — used by `push`
+- Parse YAML front-matter (if present)
+- Split on `# %%` cell markers using StringParser (respects triple-quoted strings)
+- Detect cell type from `[markdown]`, `[raw]` annotations
+- Parse cell metadata from `key=value` or JSON in marker line
+- Uncomment markdown/raw cell content
+- Uncomment magic commands (`# %matplotlib` → `%matplotlib`)
+
+**`merge(localCells, remoteNotebook) → notebook`** — used by `push`
+- Content-addressed cell matching (see Section 7)
+- Preserve cell IDs, outputs, execution counts from remote
+- Take source and cell type from local
+- Generate fresh IDs for new cells
+
+### Cell Marker Grammar
+
+```
+CELL_MARKER  := INDENT? "#" WS? "%%" EXTRA? (WS OPTIONS)?
+EXTRA        := "%"*                              # sub-cells (ignored)
+OPTIONS      := TITLE? CELL_TYPE? METADATA*
+CELL_TYPE    := "[markdown]" | "[md]" | "[raw]"   # code is default
+TITLE        := text before first [type] or key=
+METADATA     := KEY "=" JSON_VALUE
+```
+
+The primary regex: `/^\s*#\s*%%(%*)\s(.*)$/`
+The bare marker regex: `/^\s*#\s*%%\s*$/`
+
+Critical: `# %%timeit` (no space after `%%`) is a commented cell magic, NOT a cell marker. `# %% timeit` (with space) IS a cell marker with title "timeit". The space is the distinguishing character.
+
+### StringParser
+
+Tracks triple-quoted string state line-by-line to prevent false `# %%` matches inside string literals. This is non-negotiable — agents generate code containing `# %%` in strings (e.g., code that manipulates notebook format).
+
+~80 lines of TypeScript. Tracks `"""` and `'''` open/close state, handles escaped quotes, stops processing at `#` comments when not in a string.
+
+### Magic Command Handling
+
+When writing .py (pull): comment IPython magics
+```
+%matplotlib inline    →  # %matplotlib inline
+!pip install torch    →  # !pip install torch
+%%timeit              →  # %%timeit
+```
+
+When reading .py (push): uncomment them back
+```
+# %matplotlib inline  →  %matplotlib inline
+# !pip install torch  →  !pip install torch
+# %%timeit            →  %%timeit
+```
+
+Patterns recognized: lines starting with `%`, `%%`, `!`, `?`, common POSIX commands (`cd`, `ls`, `cat`, etc.), magic assignments (`x = %time expr`).
+
+### Markdown Comment/Uncomment
+
+Writing (pull):
+- Non-empty line → `# <line>`
+- Empty line → `#` (bare hash, no trailing space)
+
+Reading (push):
+- `# <text>` (hash + space + text) → `<text>`
+- `#<text>` (hash + text, no space) → `<text>`
+- `#` (bare hash) → empty string
+- No hash prefix → leave as-is (silent passthrough)
+
+### YAML Front-Matter
+
+Optional header at top of .py file:
+```python
+# ---
+# jupyter:
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
+```
+
+On pull: serialize notebook metadata as YAML front-matter.
+On push: parse and merge with remote notebook metadata. If absent, use remote's metadata as-is.
+
+### Estimated Size
+
+~760 lines of TypeScript, ~80-100 tests.
+
+| Component | ~Lines |
+|---|---|
+| Cell marker parsing + StringParser | ~130 |
+| Cell type + metadata parsing | ~120 |
+| Comment/uncomment (markdown) | ~30 |
+| Magic command handling | ~120 |
+| YAML front-matter parse/serialize | ~120 |
+| .ipynb JSON parse/serialize | ~100 |
+| Content-addressed merge | ~140 |
+
+---
+
+## 7. Content-Addressed Merge
+
+When pushing, the local .py is merged with the remote .ipynb to produce an updated .ipynb. The merge preserves cell IDs, outputs, execution counts, and cell metadata from the remote while taking source content and cell types from the local .py.
+
+### Why Not Positional-Only
+
+Positional matching (cell N in .py → cell N in .ipynb) breaks on insertion and deletion. If an agent deletes cell 3, positional matching maps every subsequent cell to the wrong counterpart — outputs get shuffled. Content-addressed matching finds where each cell actually went.
+
+### The Matching Algorithm
+
+Four passes, inspired by jupytext's `combine_inputs_with_outputs`:
+
+**Pass 1: Exact match, in order.** For each local cell, find the first unmatched remote cell of the same type with the same normalized content. Sequential — preserves order.
+
+**Pass 2: Exact match, out of order.** For remaining unmatched cells, match by type + normalized content regardless of position. Handles reordering.
+
+**Pass 3: Suffix match.** For remaining unmatched cells, check if a remote cell's source ends with the local cell's source. Handles cells that were split.
+
+**Pass 4: Positional fallback.** Match remaining unmatched cells by sequential position and cell type.
+
+### Content Normalization (`sameContent`)
+
+Collapse whitespace (runs of whitespace → single space, strip leading/trailing) before comparing. This is intentionally conservative — it survives indentation changes and trailing whitespace, which covers the most common autoformatter effects.
+
+The more aggressive normalization (stripping quotes, parentheses, commas) that jupytext uses is dangerous: `f("a", "b")` would collide with `f"ab"`, causing wrong outputs on genuinely different cells. We start conservative and can loosen if autoformatter compat requires it.
+
+**Duplicate cell handling**: When multiple cells have identical normalized content and type, Passes 1-2 match them in order (first unmatched local → first unmatched remote). This is stable and predictable. If it produces wrong matches, the agent can disambiguate by adding a distinguishing comment.
+
+### What Comes From Where
+
+| Field | Source |
+|---|---|
+| `cell.source` | Local .py |
+| `cell.cell_type` | Local .py |
+| `cell.id` | Remote .ipynb (or fresh UUID for new cells) |
+| `cell.outputs` | Remote .ipynb (empty for new cells) |
+| `cell.execution_count` | Remote .ipynb (null for new cells) |
+| `cell.metadata` | Merged: filtered metadata from .py + unfiltered from .ipynb |
+| `notebook.metadata` | Remote .ipynb (or from .py YAML header if present) |
+
+### Edge Cases
+
+- **Cell added in .py**: No matching remote cell → fresh UUID, empty outputs
+- **Cell deleted from .py**: Remote cell orphaned → dropped from result
+- **Cell reordered**: Pass 2 handles via out-of-order content match
+- **Cell type changed** (code → markdown): Won't match (different type) → treated as delete + add
+- **All cells modified**: Falls through to Pass 4 (positional), outputs preserved by position
+
+---
+
+## 8. Dirty State
+
+Tracks whether the local .py has unpushed changes using a content hash.
+
+### Mechanism
+
+On push, store SHA-256 of the .py file contents in `.colab/notebooks/<name>.json` as `pushedHash`. On subsequent operations, compare current hash to stored hash.
+
+### Where It Gates
+
+| Command | If dirty | Behavior |
+|---|---|---|
+| `run` | warn on stderr | Proceeds (runs remote version). Agent sees: "local training.py has unpushed changes — running remote version. Use `colab run training --push` to push first." |
+| `pull` | error | Refuses to overwrite. Hint: `colab push training` first, or `colab pull training --force` |
+| `push` | expected | This is the normal flow — you edit, then push |
+
+### What It Doesn't Do
+
+No push history, no commit-like versioning. The .py file's edit history is in git. The notebook's execution history is in cell outputs. The hash answers exactly one question: "has the .py changed since last push?"
+
+If this turns out to be insufficient during dogfooding, the most likely evolution is storing push timestamps alongside hashes — but we start minimal.
+
+---
+
+## 9. Auth Stack
+
+### OAuth2 Flow
+
+Register a Google OAuth2 desktop app. Login flow:
+
+1. CLI starts localhost HTTP server on random port
+2. Opens Google consent screen with PKCE challenge
+3. User consents in browser
+4. Google redirects to `localhost:{port}/callback?code=...`
+5. CLI exchanges code + PKCE verifier for tokens
+6. Tokens stored to `~/.config/colab-cli/credentials.json` (mode 0600)
+
+**Scopes** (derived from colab-vscode extension):
+- `openid`, `email`
+- `https://www.googleapis.com/auth/drive`
+- `https://www.googleapis.com/auth/colab`
+
+**Client ID/Secret**: Shipped with binary. Google's desktop app flow treats the client secret as non-secret for installed applications.
+
+### Three-Layer Token Stack
+
+```
+Layer 1: OAuth2 access token
+  Used for: Colab REST API (assign, unassign, listAssignments, getUserInfo)
+  Lifetime: ~1 hour, auto-refreshed via refresh_token
+  Header: Authorization: Bearer <access_token>
+
+Layer 2: Proxy token (per runtime)
+  Used for: WebSocket + Jupyter API on runtime
+  Obtained via: refreshConnection(endpoint) using Layer 1
+  Lifetime: ~1 hour
+  Header: X-Colab-Runtime-Proxy-Token: <proxy_token>
+
+Layer 3: XSRF token (per mutation)
+  Used for: assign(), unassign(), propagateCredentials()
+  Obtained via: GET request to same endpoint
+  Lifetime: single-use
+  Header: X-Goog-Colab-Token: <xsrf_token>
+  Pattern: GET (returns token) → POST (sends token)
+```
+
+All token refresh is invisible to the agent. The CLI handles it before each operation.
+
+### Token Storage
+
+**Global** (`~/.config/colab-cli/credentials.json`):
+```json
+{
+  "access_token": "ya29...",
+  "refresh_token": "1//...",
+  "expires_at": "2026-03-10T13:00:00Z",
+  "email": "user@gmail.com"
+}
+```
+
+---
+
+## 10. WebSocket Kernel Execution
+
+### Connection Flow
+
+```
+1. Resolve notebook → get endpoint from .colab/notebooks/<name>.json
+2. Ensure fresh proxy token (refreshConnection if near expiry)
+3. Get or create kernel (GET /api/sessions, or POST /api/sessions)
+4. Connect WebSocket:
+   wss://<proxy_url>/api/kernels/<kernel_id>/channels?session_id=<id>
+   Headers: proxy token + client agent
+   No subprotocol header (DEFAULT protocol)
+5. Send execute_request, collect outputs
+6. Execution complete when both execute_reply AND status:idle received
+```
+
+### Jupyter Message Protocol
+
+Messages are JSON text over WebSocket. No binary framing for code execution.
+
+**Outgoing (execute_request)**:
+```json
+{
+  "channel": "shell",
+  "header": {
+    "msg_id": "<uuid>",
+    "msg_type": "execute_request",
+    "username": "colab-cli",
+    "session": "<session_uuid>",
+    "version": "5.3"
+  },
+  "content": {
+    "code": "print('hello')",
+    "silent": false,
+    "store_history": true,
+    "allow_stdin": false,
+    "stop_on_error": true
+  }
+}
+```
+
+**Incoming message types**:
+
+| Channel | msg_type | Description | Action |
+|---|---|---|---|
+| iopub | `status` | Kernel busy/idle | Track state, `idle` = half of completion |
+| iopub | `stream` | stdout/stderr text | Collect + stream to agent |
+| iopub | `execute_result` | Cell return value | Collect |
+| iopub | `display_data` | Rich display output | Collect |
+| iopub | `error` | Python exception | Collect (ename, evalue, traceback) |
+| shell | `execute_reply` | Execution finished | Other half of completion |
+
+**Completion**: Both `execute_reply` (shell) AND `status: idle` (iopub) must arrive with matching `parent_header.msg_id`.
+
+**Colab-specific**: Ephemeral `colab_request` messages for Drive credential propagation. Safely ignored for CLI usage.
+
+### Connection Lifecycle
+
+Each CLI invocation opens a new WebSocket. The kernel session ID is stored and reused, so kernel state (variables, imports) persists across `colab run` and `colab exec` calls. ~500ms overhead per connection is acceptable for agent workflows.
+
+### Keep-Alive
+
+Every command that touches a notebook's runtime sends `sendKeepAlive(endpoint)` as a side effect. No background daemon. If a runtime goes idle for ~30 minutes, Colab may reclaim it — next access gets a clear error with hint to `ensure` again.
+
+---
+
+## 11. Colab API Surface
+
+Two backend domains, reverse-engineered from the colab-vscode extension (Apache-2.0):
+
+**`colab.research.google.com`** — tunnel/proxy layer
+- `/tun/m/<endpoint>/...` — proxied requests to runtime
+- Requires `?authuser=0`
+- XSRF token pattern for mutations
+
+**`colab.pa.googleapis.com`** — structured REST API
+- `/v1/...` — user info, assignments, etc.
+- Bearer token auth
+
+### Core API Methods
+
+| Method | Description | Used by |
+|---|---|---|
+| `getUserInfo()` | User profile, tier, eligible accelerators | auth status, ensure |
+| `getConsumptionUserInfo()` | Quota, compute units | auth status, status |
+| `listAssignments()` | All active runtime assignments | ls, ensure, status |
+| `assign(nbHash, params)` | Idempotent runtime assignment | ensure |
+| `unassign(endpoint)` | Teardown runtime (XSRF) | kill |
+| `refreshConnection(endpoint)` | Fresh proxy token + URL | ensure, run, push, pull |
+| `listSessions(endpoint)` | Jupyter sessions on runtime | run, exec |
+| `sendKeepAlive(endpoint)` | Prevent idle timeout | all runtime commands |
+
+### Request Patterns
+
+All responses have `)]}'` XSSI prefix — strip before JSON parse.
+
+Custom headers:
+```
+X-Colab-Client-Agent: colab-cli          # all requests
+X-Colab-Tunnel: Google                    # tunnel requests
+X-Colab-Runtime-Proxy-Token: <token>      # runtime requests
+X-Goog-Colab-Token: <xsrf>               # mutations
+```
+
+### Contents API (File Transfer)
+
+The Jupyter Contents API works through the Colab tunnel:
+- `GET/PUT/POST/DELETE /api/contents/{path}`
+- Full CRUD for files and notebooks on the runtime
+- Binary files are base64-encoded in JSON body
+- Same proxy token auth as other runtime requests
+- Size limit: ~384 MiB effective (512 MiB body - base64 overhead)
+
+Used for: `pull` (download .ipynb), `push` (upload .ipynb), `upload`/`download` (file transfer).
+
+---
+
+## 12. Output Formatting
+
+### Per-Command Defaults
+
+| Command type | Default format | Rationale |
+|---|---|---|
+| Data commands (`ls`, `status`, `auth status`) | JSON | Agents parse these for information |
+| Activity commands (`run`, `ensure`, `push`, `pull`) | Human-readable, streaming | Agents observe these; streaming matters for long operations |
+
+`--json` flag on any command forces JSON output. Activity commands in JSON mode buffer all output and return a single JSON object at the end.
+
+### JSON Envelope
+
+Every command uses the same envelope:
+
+```typescript
+interface CommandResult<T = unknown> {
+  ok: boolean;          // did the command achieve its primary purpose?
+  command: string;      // "run", "ensure", "auth.login", etc.
+  ts: string;           // ISO 8601
+  data?: T;             // command-specific payload — present whenever there's useful data
+  error?: {             // present when ok is false
+    code: string;       // machine-readable: QUOTA_EXCEEDED, EXECUTION_ERROR, etc.
+    message: string;    // human-readable
+    hint?: string;      // recovery command or suggestion
+  };
+}
+```
+
+**`ok` semantics**: Reflects whether the command achieved its purpose. For `run`, the purpose is "execute code successfully." A Python exception means `ok: false`. A CLI-level failure (network, auth) also means `ok: false` — distinguished by `error.code` and exit code.
+
+**`data` and `error` can coexist.** When `run` hits a Python error, `data` contains the execution outputs (including the traceback) and `error` contains the structured error. This lets agents inspect both the error and any partial outputs (e.g., stdout before the exception). `data` is not gated on `ok: true` — it's present whenever there's useful information to return.
+
+### Exit Codes
+
+| Code | Name | Description |
+|---|---|---|
+| 0 | OK | Success |
+| 1 | ERROR | General/unexpected error |
+| 2 | USAGE | Invalid arguments |
+| 3 | NOT_FOUND | Notebook doesn't exist, runtime reclaimed |
+| 4 | AUTH | Not authenticated, token expired |
+| 5 | QUOTA | No compute units for requested resource |
+| 6 | TIMEOUT | Assignment or execution timed out |
+| 7 | EXEC_ERROR | Python code raised an exception |
+
+Exit code 7 is intentional: agents use exit codes to distinguish "the CLI broke" (1) from "my Python code has a bug" (7).
+
+---
+
+## 13. State Management
+
+### Two State Locations
+
+**Global** (`~/.config/colab-cli/`):
+```
+credentials.json     # OAuth2 tokens (mode 0600)
+config.json          # User preferences (optional)
+```
+
+**Per-project** (`.colab/` in project root):
+```
+notebooks/
+  <name>.json        # Runtime state: endpoint, tokens, kernel, pushedHash
+  <name>.ipynb       # Cached remote .ipynb
+```
+
+`.colab/` should be gitignored (contains tokens, cached binary data). The `.py` files in the project root should be committed.
+
+### Per-Notebook State (`.colab/notebooks/<name>.json`)
+
+```json
+{
+  "notebookHash": "base64...",
+  "endpoint": "m-s-kkb4...",
+  "gpu": "t4",
+  "proxyUrl": "https://m-s-kkb4....colab.sandbox.google.com",
+  "proxyToken": "eyJ...",
+  "proxyTokenExpiresAt": "2026-03-10T13:00:00Z",
+  "kernelId": "fd343487-...",
+  "sessionId": "a1b2c3d4-...",
+  "createdAt": "2026-03-10T12:00:00Z",
+  "ttlExpiresAt": "2026-03-10T14:00:00Z",
+  "lastKeepAlive": "2026-03-10T12:30:00Z",
+  "pushedHash": "sha256:abc123...",
+  "remoteModifiedAt": "2026-03-10T12:35:00Z"
+}
+```
+
+### Concurrency
+
+Multiple CLI invocations may run simultaneously (multi-agent). State file access uses advisory file locking (`flock`) on `.colab/notebooks/<name>.json.lock` with 5-second timeout.
+
+---
+
+## 14. Testing Strategy
+
+### Differential Oracle Testing (Primary)
+
+Use `uvx jupytext` as a live test oracle. Run both our TypeScript converter and jupytext on identical inputs, diff outputs. Zero-install oracle — works anywhere `uv` is available.
+
+```
+Our .ipynb → .py    vs    uvx jupytext --to py:percent
+Our .py → .ipynb    vs    uvx jupytext --to notebook
+```
+
+Every fixture file feeds the oracle test automatically. Adding one .ipynb file tests both conversion directions.
+
+### Test Fixture Sources
+
+**Tier 1 — Gold standard** (from jupytext repo):
+- `tests/data/notebooks/inputs/ipynb_py/*.ipynb` — ~24 source notebooks
+- `tests/data/notebooks/outputs/ipynb_to_percent/*.py` — expected percent output
+- `tests/functional/simple_notebooks/test_read_simple_percent.py` — ~25 inline test cases
+
+**Tier 2 — Schema validation** (from nbformat repo):
+- `tests/test4.ipynb`, `tests/test4.5.ipynb` — reference .ipynb v4/v4.5
+
+### Property-Based Testing (fast-check)
+
+Round-trip invariants on generated notebooks:
+- `parse(serialize(notebook)).cells.length === notebook.cells.length`
+- Cell types preserved through round-trip
+- Source content preserved (modulo trailing whitespace)
+- `serialize(parse(text))` is idempotent after first pass
+- Merge preserves cell IDs on unmodified cells
+- Merge preserves outputs on unmodified cells
+
+### Snapshot Testing (Bun built-in)
+
+Golden-file validation with `toMatchSnapshot()`. Frozen expected output for each fixture. Update explicitly with `bun test --update-snapshots`.
+
+### jupytext --test Validation
+
+Use jupytext's own round-trip validator on our output:
+```
+Our TS produces .py → uvx jupytext --test our-output.py --to notebook
+```
+Catches "valid percent format but not compatible with jupytext" bugs.
+
+### Corpus-Based Regression (Nightly)
+
+Real-world notebooks from GitHub (permissive licenses). Glob-based test discovery — adding a .ipynb to the corpus directory automatically runs it through all test layers.
+
+### Compounding
+
+Every fixture feeds all layers simultaneously:
+
+```
+  New .ipynb fixture added
+         │
+    ┌────┼────┬──────────┐
+    ▼    ▼    ▼          ▼
+ Snapshot  Differential  Property   jupytext --test
+ testing   oracle        round-trip  validation
+```
+
+One fixture addition = four layers of testing. Fast-check failures become new fixtures, which then feed all other layers.
+
+### Implementation Order
+
+1. Golden files + differential oracle (TDD from day 1)
+2. Snapshot tests (free on top of golden files)
+3. Unit tests for StringParser, magic handling, metadata parsing
+4. Property-based round-trips (after basic parsing works)
+5. `jupytext --test` validation
+6. Corpus regression (after core stabilizes)
+
+---
+
+## 15. Project Structure
+
+```
+colab-cli/
+├── src/
+│   ├── cli/                     # Command parsing and dispatch
+│   │   ├── index.ts             # Entry point, command router
+│   │   ├── auth.ts              # auth login/status/logout
+│   │   ├── ensure.ts            # ensure command
+│   │   ├── run.ts               # run command
+│   │   ├── exec.ts              # exec command
+│   │   ├── pull.ts              # pull command
+│   │   ├── push.ts              # push command
+│   │   ├── diff.ts              # diff command
+│   │   ├── ls.ts                # ls command
+│   │   ├── status.ts            # status command
+│   │   ├── kill.ts              # kill command
+│   │   ├── restart.ts           # restart command
+│   │   ├── interrupt.ts         # interrupt command
+│   │   └── output.ts            # JSON/human-readable formatting
+│   ├── notebook/                # Percent-format conversion
+│   │   ├── parse.ts             # .py percent → cell list
+│   │   ├── serialize.ts         # notebook → .py percent
+│   │   ├── merge.ts             # Content-addressed merge
+│   │   ├── string-parser.ts     # Triple-quote tracking
+│   │   ├── magic.ts             # Magic command comment/uncomment
+│   │   ├── header.ts            # YAML front-matter
+│   │   ├── types.ts             # Notebook/cell type definitions
+│   │   └── ipynb.ts             # .ipynb JSON parse/serialize
+│   ├── colab/                   # Colab API client
+│   │   ├── client.ts            # HTTP client for Colab APIs
+│   │   ├── headers.ts           # Custom header construction
+│   │   ├── types.ts             # Zod schemas for API responses
+│   │   └── xssi.ts              # XSSI prefix stripping
+│   ├── jupyter/                 # Jupyter kernel communication
+│   │   ├── connection.ts        # KernelConnection (WebSocket)
+│   │   ├── messages.ts          # Jupyter message types
+│   │   ├── contents.ts          # Contents API client
+│   │   └── api.ts               # Jupyter REST API (sessions, kernels)
+│   ├── auth/                    # OAuth2 implementation
+│   │   ├── oauth.ts             # OAuth2 flow (PKCE, loopback)
+│   │   ├── tokens.ts            # Token storage and refresh
+│   │   └── scopes.ts            # Required scopes
+│   ├── state/                   # Local state management
+│   │   ├── store.ts             # State file read/write with locking
+│   │   ├── notebooks.ts         # Per-notebook state
+│   │   └── config.ts            # User/project config
+│   └── util/
+│       ├── errors.ts            # Error types with codes and hints
+│       ├── hash.ts              # Content hashing (SHA-256)
+│       ├── ids.ts               # ID generation (notebookHash, names)
+│       └── time.ts              # Duration parsing, TTL
+├── test/
+│   ├── fixtures/
+│   │   ├── golden/              # Known-good .ipynb/.py pairs
+│   │   └── corpus/              # Real-world notebooks (gitignored)
+│   ├── unit/                    # Unit tests per module
+│   ├── snapshot/                # Snapshot/golden-file tests
+│   ├── differential/            # Oracle tests (vs uvx jupytext)
+│   ├── property/                # fast-check property tests
+│   └── corpus/                  # Corpus regression tests
+├── DESIGN.md
+├── SKILL.md
+├── package.json
+├── tsconfig.json
+└── bunfig.toml
+```
+
+---
+
+## 16. Open Questions
+
+### Q1: OAuth Scopes
+
+Exact scopes must be extracted from the published Colab VS Code extension VSIX. We need our own OAuth app but must use compatible scopes.
+
+### Q2: Colab API Stability
+
+Undocumented API — could change. Mitigation: Zod schemas for response validation. Track changes via colab-vscode extension updates.
+
+### Q3: Rate Limits
+
+Unknown. Mitigation: retry with exponential backoff for 429 responses.
+
+### Q4: notebookHash Generation
+
+`assign()` requires a specific hash format (UUID → web-safe base64, length 44). Exact algorithm needs verification from colab-vscode source.
+
+### Q5: Cell Addressing UX
+
+The `--cell <ref>` resolution order (integer → title → ID) may cause ambiguity if a cell title is a number. May need prefix syntax: `#3` for index, `@title` for title, or similar. Needs dogfooding.
+
+### Q6: Multi-Cell Execution Semantics
+
+When `colab run training` executes all cells: sequential or parallel? Almost certainly sequential (matches Colab's "Run All" behavior). But do we stop on first error or continue? Leaning stop-on-error with `--continue-on-error` flag.
+
+### Q7: Streaming Format
+
+Activity commands stream human-readable output by default. What exactly does streaming look like for `colab run` with multiple cells? Need to design the cell-by-cell progress output.
+
+### Q8: Drive Persistence Mechanism
+
+`pull`/`push` use the runtime Contents API. We claim Colab/Drive is source of truth, but we don't yet know: does `assign()` with a notebookHash load an existing Drive notebook? Do Contents API writes auto-sync to Drive? Or do we need separate Drive API calls? This determines whether recovery after reclamation uses Drive or only our local cache. Must be answered empirically during Phase 2.
+
+### Q9: TTL Enforcement
+
+`--ttl` is accepted by `ensure` but no enforcement mechanism exists. No daemon, no confirmed server-side support in `assign()`. Options: best-effort on next CLI invocation, background timer via Bun subprocess, or discover that `assign()` accepts a TTL parameter. Resolve during Phase 2.
+
+---
+
+## 17. Implementation Roadmap
+
+### Phase 1: Percent-Format Conversion + Test Infra
+
+Can be built and fully tested without touching the Colab API. Pure TypeScript, pure local.
+
+- [x] Project scaffolding (bun init, tsconfig, directory structure)
+- [x] Fetch jupytext test fixtures (sparse clone golden pairs)
+- [x] Set up differential oracle infra (`uvx jupytext` test helpers)
+- [x] `src/notebook/types.ts` — Notebook/Cell type definitions, .ipynb JSON types
+- [x] `src/notebook/ipynb.ts` — .ipynb parse/serialize (handle source as string vs array, cell IDs, nbformat 4/4.5)
+- [x] `src/notebook/string-parser.ts` — Triple-quote state tracker
+- [x] `src/notebook/magic.ts` — Magic command comment/uncomment
+- [x] `src/notebook/header.ts` — YAML front-matter parse/serialize
+- [x] `src/notebook/serialize.ts` — `ipynbToPercent()`: notebook → .py
+- [x] Differential oracle tests: 20/20 golden pairs passing (4 skipped: R magic ×2, html/latex language=, triple-quote markdown — all irrelevant to Colab)
+- [x] `src/notebook/parse.ts` — `percentToCells()`: .py → cell list
+- [x] Round-trip differential tests: 20/20 golden .py → cells matches golden .ipynb
+- [x] `src/notebook/merge.ts` — Content-addressed merge (4-pass)
+- [x] Full pipeline round-trip tests: 20/20 (.ipynb → .py → cells → merge → verify)
+- [x] Property-based round-trip tests (fast-check): 16 properties, 500 runs each
+- [x] `jupytext --to notebook --test` validation: 20/20 pass
+- [x] Code review fixes (round 1): #1 serializeMetaValue, #2 Plotly outputs, #3 POSIX uncommenting, #4 FILTERED_METADATA_KEYS dedup, #5 StringParser escaped triple quotes, #6 raw cell without kernelspec, #7 parseMetaValue crash, #8 `//` in MAGIC_RE, #9 freshCellId entropy
+- [x] Dead code cleanup (header.ts: indentedComment, serializeYamlValue, HEADER_ALLOWED_EXTRA_KEYS)
+- [x] Code review fixes (round 2): #10 same-line triple-quote escape, #11 merge pass 4 gap-bounded, #12 bare POSIX without args, #13 YAML single-quote unescaping
+- [ ] Snapshot tests for all golden pairs
+
+### Phase 2: Colab API Proof-of-Life
+
+Prove the undocumented API works end-to-end. Manually tested, script-driven.
+
+- [ ] Extract OAuth scopes from published VSIX (resolves Q1)
+- [ ] `src/auth/oauth.ts` — OAuth2 PKCE loopback flow
+- [ ] `src/auth/tokens.ts` — Token storage, refresh, expiry check
+- [ ] `src/colab/xssi.ts` — XSSI prefix stripping
+- [ ] `src/colab/headers.ts` — Custom header construction
+- [ ] `src/colab/types.ts` — Zod schemas for API responses
+- [ ] `src/colab/client.ts` — ColabClient: getUserInfo, listAssignments, assign, unassign, refreshConnection, sendKeepAlive
+- [ ] End-to-end script: auth → assign → refreshConnection → verify runtime alive
+- [ ] `src/jupyter/contents.ts` — Contents API client (GET/PUT .ipynb)
+- [ ] End-to-end script: upload .ipynb → download .ipynb → verify round-trip
+- [ ] `src/jupyter/api.ts` — Jupyter REST API (list/create sessions)
+- [ ] `src/jupyter/connection.ts` — KernelConnection (WebSocket)
+- [ ] `src/jupyter/messages.ts` — Jupyter message types
+- [ ] End-to-end script: connect kernel → execute `print("hello")` → collect output
+- [ ] Resolve Q8 (Drive persistence — does assign load from Drive? Do Contents writes sync?)
+- [ ] Resolve Q4 (notebookHash generation algorithm)
+- [ ] Resolve Q9 (TTL — does assign accept TTL params?)
+
+### Phase 3: Core CLI Commands
+
+Wire the pieces together into real commands.
+
+- [ ] `src/util/errors.ts` — Error types with codes and hints
+- [ ] `src/util/hash.ts` — Content hashing (SHA-256)
+- [ ] `src/util/ids.ts` — ID generation
+- [ ] `src/util/time.ts` — Duration parsing
+- [ ] `src/state/store.ts` — State file read/write with locking
+- [ ] `src/state/notebooks.ts` — Per-notebook state (project root discovery, .colab/ management)
+- [ ] `src/cli/output.ts` — JSON envelope, human-readable formatting
+- [ ] `src/cli/index.ts` — Entry point, command router
+- [ ] `src/cli/auth.ts` — `colab auth login/status/logout`
+- [ ] `src/cli/ensure.ts` — `colab ensure` (get-or-create, reclamation recovery, empty .ipynb creation)
+- [ ] `src/cli/pull.ts` — `colab pull` (Contents API → ipynbToPercent → write .py, dirty check)
+- [ ] `src/cli/push.ts` — `colab push` (percentToCells → merge → Contents API, conflict detection)
+- [ ] `src/cli/run.ts` — `colab run` (WebSocket execute, streaming, --push, --cell, dirty warning)
+- [ ] `src/cli/exec.ts` — `colab exec` (ad-hoc execution, shared kernel)
+- [ ] Dogfood: ensure → pull → edit → push → run cycle works end-to-end
+
+### Phase 4: Supporting Commands + Polish
+
+- [ ] `src/cli/ls.ts` — `colab ls`
+- [ ] `src/cli/status.ts` — `colab status`
+- [ ] `src/cli/kill.ts` — `colab kill`
+- [ ] `src/cli/diff.ts` — `colab diff`
+- [ ] `src/cli/restart.ts` — `colab restart`
+- [ ] `src/cli/interrupt.ts` — `colab interrupt`
+- [ ] `colab upload` / `colab download`
+- [ ] SKILL.md (agent-facing guide, written against real CLI)
+- [ ] Corpus regression tests (nightly)
+- [ ] `run` data shape finalized and documented
+- [ ] Resolve remaining open questions from dogfooding
+
+---
+
+## 18. Addendums
+
+Design tweaks, discoveries, and decisions made during implementation. Newest first.
+
+### A6: Code review round 2 hardening (fixes #10-#13)
+
+Second round of independent reviews (Opus subagent + Codex CLI). Both found the same two bugs (#10, #13). All fixed with red-green discipline:
+
+**Correctness fixes:**
+- **#10** StringParser same-line triple-quote close used `indexOf` — didn't skip `\` escapes. `x = """foo\"""` falsely closed the string. Fixed with character-by-character scan matching the multi-line close logic.
+- **#11** Merge pass 4 global FIFO misassigned cells across anchor boundaries. Remote `[A, B, C, D]`, local `[A_mod, C, D_mod]` gave D_mod → B's ID instead of D's. Fixed with gap-bounded matching: anchored matches from passes 1-3 partition into gaps, FIFO runs within each gap. Within-gap ambiguity (1 local, 2+ remotes, can't tell which was deleted) remains an inherent limitation.
+- **#12** Bare POSIX commands without arguments (`ls`, `cd` alone) weren't matched by `isMagic` — only the "command + space + args" path fired. Fixed by checking `POSIX_COMMANDS.has(trimmed)` when no space found.
+- **#13** YAML header parser didn't unescape `''` → `'` in single-quoted scalars. `display_name: 'Bob''s Python'` parsed as `Bob''s Python`. Fixed by adding `.replace(/''/g, "'")` after stripping outer quotes.
+
+Test count: 166 → 174 (8 regression tests added). All 174 passing.
+
+### A5: Code review hardening (fixes #1-#9)
+
+Two independent reviews (Opus subagent + Codex CLI) found the same critical bugs. All fixed with red-green discipline:
+
+**Correctness fixes:**
+- **#1** `serializeMetaValue` corrupted strings — global `.replace(/,/g, ", ")` hit inside quoted values. Fixed with regex that skips quoted regions.
+- **#2** Plotly JSON output objects corrupted — `JSON.stringify` on parse then `splitSource` on serialize turned objects into stringified arrays. Fixed by preserving objects as-is in `CellOutput.data`.
+- **#3** POSIX commands turned into magics — `# mv tmp` → `mv tmp`. Fixed by making `uncommentMagics` use strict mode: only uncomment unambiguous `%`, `!`, `?` prefixed magics.
+- **#5** `StringParser.indexOf` didn't handle escaped triple quotes — `\"\"\"` inside triple-quoted strings caused false close. Fixed with character-by-character scan that skips `\X` escape sequences.
+- **#6** Raw cell on top silently dropped without kernelspec — `startCellIdx` advanced but header returned null. Fixed by resetting `startCellIdx = 0` when header is null but raw cell content exists.
+- **#7** `parseMetaValue` crashed on malformed JSON — uncaught `JSON.parse`. Fixed with try-catch fallback to raw string value.
+
+**Cleanup fixes:**
+- **#4** `FILTERED_METADATA_KEYS` duplicated in serialize.ts, merge.ts, and tests. Extracted to `constants.ts`.
+- **#8** `//` in MAGIC_RE is not an IPython magic. Removed.
+- **#9** `freshCellId` only 32 bits entropy (8 hex chars). Changed to full UUID (128 bits).
+- Dead code removed from header.ts: `indentedComment()`, `serializeYamlValue()`, `HEADER_ALLOWED_EXTRA_KEYS` (extra-keys loop was unreachable).
+
+Test count: 160 → 166 (6 regression tests added). All 166 passing.
+
+### A4: Magic commenting is inherently lossy for ambiguous comments
+
+Property-based testing surfaced this: a Python comment `# !ls -la` is byte-identical to a commented-out shell magic `!ls -la`. On push, `uncommentMagics` assumes the latter. jupytext has the same behavior — it's inherent to the percent format.
+
+In practice this rarely matters: agents write actual code, not comments that happen to start with `%`, `!`, `?`. If it becomes a problem, the workaround is to add a non-magic character: `# Note: !ls -la`.
+
+Similarly, cell sources with trailing `\n` can't round-trip because trailing newlines are indistinguishable from inter-cell PEP 8 spacing. Real .ipynb sources don't end with `\n` (convention: last source array element has no trailing newline).
+
+### A3: PEP 8 blank lines must look ahead past non-code cells
+
+The `blankLinesAfterCell` function (serialize.ts) can't just examine the immediate prev/next cell pair. When markdown/raw cells sit between code cells, the PEP 8 two-blank-line gap for function/class definitions must go on the code-cell side, not the non-code→code boundary.
+
+Rule: non-code cells always get 1 blank line after them. Code cells look ahead past intervening markdown/raw to find the next code cell — if it starts with `def`/`class`/`@`, the 2-line gap is front-loaded after the code cell.
+
+### A2: Magic command commenting matches jupytext defaults
+
+jupytext's percent format comments IPython magics by default (`comment_magics=True` in the format options). Our implementation matches: `%matplotlib` → `# %matplotlib`. Cell magic `# %%timeit` (no space after `%%`) is a commented magic, NOT a cell marker. `# %% timeit` (with space) IS a cell marker with title "timeit".
+
+Recognized patterns: `%`, `%%`, `!`, `?`, POSIX commands (`cd`, `ls`, `cat`, `pip`, etc.), magic assignments (`x = %time expr`). False positive guard: `cat = 42` is NOT a magic (assignment to a POSIX command name).
+
+### A1: Content normalization kept conservative
+
+The merge `sameContent` function uses whitespace-only normalization (collapse runs, strip trailing). jupytext's aggressive normalization (stripping quotes, parentheses, commas) is dangerous — `f("a", "b")` would collide with `f"ab"`, causing wrong outputs on genuinely different cells. We start conservative.

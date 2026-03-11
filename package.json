@@ -1,0 +1,19 @@
+{
+  "name": "colab-cli",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "test:unit": "bun test test/unit",
+    "test:snapshot": "bun test test/snapshot",
+    "test:diff": "bun test test/differential",
+    "test:property": "bun test test/property"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "fast-check": "^4.6.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
