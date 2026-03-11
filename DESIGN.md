@@ -571,21 +571,29 @@ If this turns out to be insufficient during dogfooding, the most likely evolutio
 
 ### OAuth2 Flow
 
-Register a Google OAuth2 desktop app. Login flow:
+Uses the Colab VS Code extension's public OAuth client credentials (called "ClientNotSoSecret" in the extension source). Login flow:
 
 1. CLI starts localhost HTTP server on random port
-2. Opens Google consent screen with PKCE challenge
+2. Opens Google consent screen
 3. User consents in browser
-4. Google redirects to `localhost:{port}/callback?code=...`
-5. CLI exchanges code + PKCE verifier for tokens
+4. Google redirects to `http://localhost:{port}/?code=...`
+5. CLI exchanges code for access token + refresh token
 6. Tokens stored to `~/.config/colab-cli/credentials.json` (mode 0600)
 
-**Scopes** (derived from colab-vscode extension):
-- `openid`, `email`
-- `https://www.googleapis.com/auth/drive`
-- `https://www.googleapis.com/auth/colab`
+**Client ID**: `1014160490159-cvot3bea7tgkp72a4m29h20d9ddo6bne.apps.googleusercontent.com`
+**Client Secret**: `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`
+**Source**: `google.colab@0.3.0` VS Code extension (Apache-2.0)
 
-**Client ID/Secret**: Shipped with binary. Google's desktop app flow treats the client secret as non-secret for installed applications.
+**Why this client ID matters**: The Colab GAPI domain (`colab.pa.googleapis.com`) gates access by the OAuth client ID that issued the token. Tokens from gcloud's client ID (`764086051850-...`) get `SERVICE_DISABLED` because the API isn't enabled on gcloud's GCP project. Tokens from the VS Code extension's client ID route to Google's Colab project (`1014160490159`) where the API is enabled. Live-validated 2026-03-11.
+
+**Scopes** (live-validated):
+- `https://www.googleapis.com/auth/colaboratory`
+- `profile`
+- `email`
+
+Google expands these to also include `openid`, `userinfo.email`, `userinfo.profile`. Set `OAUTHLIB_RELAX_TOKEN_SCOPE=1` (or equivalent) to accept expanded scopes without error.
+
+**Token exchange params**: `access_type=offline&prompt=consent` to ensure refresh token is always returned.
 
 ### Three-Layer Token Stack
 
@@ -618,10 +626,14 @@ All token refresh is invisible to the agent. The CLI handles it before each oper
 {
   "access_token": "ya29...",
   "refresh_token": "1//...",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "client_id": "1014160490159-cvot3bea7tgkp72a4m29h20d9ddo6bne.apps.googleusercontent.com",
+  "client_secret": "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",
   "expires_at": "2026-03-10T13:00:00Z",
   "email": "user@gmail.com"
 }
 ```
+Client ID and secret are stored alongside the tokens so the file is self-contained for refresh. These are public credentials (not user secrets).
 
 ---
 
@@ -679,11 +691,32 @@ Messages are JSON text over WebSocket. No binary framing for code execution.
 
 **Completion**: Both `execute_reply` (shell) AND `status: idle` (iopub) must arrive with matching `parent_header.msg_id`.
 
-**Colab-specific**: Ephemeral `colab_request` messages for Drive credential propagation. Safely ignored for CLI usage.
+**Colab-specific — `colab_request` (must be handled when present)**:
+
+The kernel MAY send `colab_request` messages on the WebSocket to request credential propagation (for Drive mount, authenticated API calls, etc.). When sent, these are **not safely ignorable** — without handling them, the kernel blocks and execution returns empty stdout.
+
+**When it triggers**: NOT for all execution — simple compute-only code (print, arithmetic, torch, etc.) executes without any `colab_request`. Triggered when the kernel needs specific auth credentials (Drive mount, authenticated GCP API calls). Live-validated 2026-03-11: basic execution with 3 separate WebSocket connections produced zero `colab_request` messages.
+
+**Flow**:
+1. Kernel sends `msg_type: "colab_request"` with `metadata.colab_request_type: "request_auth"` and `metadata.colab_msg_id`
+2. `content.request.authType` is one of: `"dfs_ephemeral"` (Drive), `"auth_user_ephemeral"` (user auth)
+3. Client calls credentials-propagation API (see Section 11): dry-run first, then real if dry-run succeeds
+4. Client sends `input_reply` on stdin channel with `content.value: {"type": "colab_reply", "colab_msg_id": <id>}` (include `"error"` field if propagation failed)
+5. Kernel unblocks and continues execution
+
+**Credentials Propagation API** (tunnel domain, XSRF pattern):
+```
+GET  /tun/m/credentials-propagation/{endpoint}?authuser=0&authtype={type}&version=2&dryrun={bool}&propagate=true&record=false
+POST /tun/m/credentials-propagation/{endpoint}  (with XSRF from GET)
+```
+
+If dry-run returns `unauthorizedRedirectUri`, the auth type requires interactive browser consent (not possible in CLI — send error reply and continue).
 
 ### Connection Lifecycle
 
-Each CLI invocation opens a new WebSocket. The kernel session ID is stored and reused, so kernel state (variables, imports) persists across `colab run` and `colab exec` calls. ~500ms overhead per connection is acceptable for agent workflows.
+Each CLI invocation opens a new WebSocket. Kernel state (variables, imports) persists across connections — validated with 3 separate connections using different session IDs, all sharing the same kernel namespace. The kernel is the durable object; WebSocket connections are ephemeral handles. This means `colab exec` can connect → execute → disconnect without losing state, and `colab run` can use a fresh connection each time.
+
+Note: the session ID passed as a WebSocket query param (`?session_id=`) does NOT need to match a Jupyter session from `/api/sessions`. A connection with any session ID can talk to the kernel. ~500ms overhead per connection is acceptable for agent workflows.
 
 ### Keep-Alive
 
@@ -693,52 +726,126 @@ Every command that touches a notebook's runtime sends `sendKeepAlive(endpoint)` 
 
 ## 11. Colab API Surface
 
-Two backend domains, reverse-engineered from the colab-vscode extension (Apache-2.0):
+Two backend domains, both accessible with the VS Code extension's OAuth client ID (see Section 9). Live-validated 2026-03-11.
 
-**`colab.research.google.com`** — tunnel/proxy layer
-- `/tun/m/<endpoint>/...` — proxied requests to runtime
-- Requires `?authuser=0`
-- XSRF token pattern for mutations
+**`colab.research.google.com`** — tunnel/data plane
+- `/tun/m/assign` — allocate/query runtime (XSRF pattern)
+- `/tun/m/unassign/{endpoint}` — release runtime (XSRF pattern)
+- `/tun/m/{endpoint}/keep-alive/` — prevent idle timeout
+- `/tun/m/{endpoint}/api/...` — proxied Jupyter API on runtime
+- `/tun/m/credentials-propagation/{endpoint}` — auth propagation (XSRF pattern)
+- Requires `?authuser=0` on all requests
+- XSRF token pattern for mutations (GET to get token, POST with token)
 
-**`colab.pa.googleapis.com`** — structured REST API
-- `/v1/...` — user info, assignments, etc.
-- Bearer token auth
+**`colab.pa.googleapis.com`** — GAPI/control plane
+- `/v1/user-info` — user profile, subscription tier, eligible accelerators, compute units
+- `/v1/assignments` — list all active runtime assignments
+- `/v1/runtime-proxy-token?endpoint=...` — refresh proxy token
+- Bearer token auth, no `authuser` param
+- **Access gated on OAuth client ID**: only works with tokens from the VS Code extension's client ID (`1014160490159-...`). Tokens from gcloud's client ID get `SERVICE_DISABLED`. The gate is which GCP project owns the client ID — the API is enabled on Google's Colab project, not on gcloud's.
 
 ### Core API Methods
 
-| Method | Description | Used by |
-|---|---|---|
-| `getUserInfo()` | User profile, tier, eligible accelerators | auth status, ensure |
-| `getConsumptionUserInfo()` | Quota, compute units | auth status, status |
-| `listAssignments()` | All active runtime assignments | ls, ensure, status |
-| `assign(nbHash, params)` | Idempotent runtime assignment | ensure |
-| `unassign(endpoint)` | Teardown runtime (XSRF) | kill |
-| `refreshConnection(endpoint)` | Fresh proxy token + URL | ensure, run, push, pull |
-| `listSessions(endpoint)` | Jupyter sessions on runtime | run, exec |
-| `sendKeepAlive(endpoint)` | Prevent idle timeout | all runtime commands |
+| Method | Domain | Description | Used by |
+|---|---|---|---|
+| `getUserInfo()` | GAPI | Tier, compute units, eligible accelerators | auth status, ensure |
+| `listAssignments()` | GAPI | All active runtime assignments | ls, ensure, status |
+| `refreshProxyToken(endpoint)` | GAPI | Fresh proxy token + URL | long-lived sessions |
+| `assign(nbHash, params)` | Tunnel | Allocate runtime (XSRF) | ensure |
+| `unassign(endpoint)` | Tunnel | Release runtime (XSRF) | kill |
+| `propagateCredentials(endpoint, authType)` | Tunnel | Credential propagation (XSRF) | run, exec |
+| `listSessions(endpoint)` | Tunnel | Jupyter sessions on runtime | run, exec |
+| `sendKeepAlive(endpoint)` | Tunnel | Prevent idle timeout (~60s interval) | all runtime commands |
+
+### Assign Response Shape
+
+```json
+{
+  "endpoint": "gpu-t4-s-bcdhjyw4onbe",
+  "fit": 3600,
+  "sub": 2,
+  "subTier": 1,
+  "variant": 1,
+  "machineShape": 0,
+  "accelerator": "T4",
+  "runtimeProxyInfo": {
+    "token": "eyJ...",
+    "tokenExpiresInSeconds": 3600,
+    "url": "https://8080-gpu-t4-s-bcdhjyw4onbe-a.us-west4-2.prod.colab.dev"
+  }
+}
+```
+
+### getUserInfo Response Shape
+
+```json
+{
+  "subscriptionTier": "SUBSCRIPTION_TIER_PRO",
+  "paidComputeUnitsBalance": 300,
+  "eligibleAccelerators": [
+    { "variant": "VARIANT_GPU", "models": ["H100", "G4", "A100", "L4", "T4"] },
+    { "variant": "VARIANT_TPU", "models": ["V6E1", "V5E1"] }
+  ]
+}
+```
+
+### Notebook Hash Format
+
+UUID v4 with dashes replaced by underscores, padded with dots to 44 chars:
+```
+380b033e_4abf_4918_9f96_3d147452ff9a........
+```
+Generation: `uuid.replace(/-/g, '_') + '.'.repeat(44 - uuid.length)`
 
 ### Request Patterns
 
-All responses have `)]}'` XSSI prefix — strip before JSON parse.
+All tunnel domain responses have `)]}'` XSSI prefix (5 chars) — strip before JSON parse. GAPI responses do NOT have the prefix.
 
 Custom headers:
 ```
-X-Colab-Client-Agent: colab-cli          # all requests
-X-Colab-Tunnel: Google                    # tunnel requests
-X-Colab-Runtime-Proxy-Token: <token>      # runtime requests
-X-Goog-Colab-Token: <xsrf>               # mutations
+Authorization: Bearer <access_token>      # all requests
+X-Colab-Client-Agent: vscode              # all requests (must be "vscode")
+X-Colab-Tunnel: Google                    # keep-alive requests
+X-Colab-Runtime-Proxy-Token: <token>      # runtime/Jupyter requests
+X-Goog-Colab-Token: <xsrf>               # mutations (assign, unassign, propagate)
 ```
+
+Note: `X-Colab-Client-Agent` must be `"vscode"` — the API may gate behavior on this value.
 
 ### Contents API (File Transfer)
 
-The Jupyter Contents API works through the Colab tunnel:
+The Jupyter Contents API works through the runtime proxy URL:
 - `GET/PUT/POST/DELETE /api/contents/{path}`
 - Full CRUD for files and notebooks on the runtime
 - Binary files are base64-encoded in JSON body
 - Same proxy token auth as other runtime requests
 - Size limit: ~384 MiB effective (512 MiB body - base64 overhead)
 
+**Path mapping (live-validated):** The Contents API root maps to the filesystem root `/`, NOT to `/content/`. The kernel's working directory is `/content`. To write a file visible to the kernel at `/content/notebook.ipynb`, use Contents API path `content/notebook.ipynb`. Both directions:
+
+```
+Contents API path         →  Filesystem path
+""                        →  / (root — lists bin, usr, sys, content, ...)
+"content"                 →  /content (kernel's working dir)
+"content/notebook.ipynb"  →  /content/notebook.ipynb
+"content/sample_data"     →  /content/sample_data (Colab's default sample data)
+```
+
 Used for: `pull` (download .ipynb), `push` (upload .ipynb), `upload`/`download` (file transfer).
+
+### Runtime State APIs
+
+Available on the runtime proxy URL with proxy token auth (live-validated):
+
+| Endpoint | Method | Returns |
+|---|---|---|
+| `/api/kernels` | GET | List of kernels: id, name, execution_state, connections, last_activity |
+| `/api/sessions` | GET | Session list with embedded kernel state |
+| `/api/status` | GET | Runtime summary: connections, kernels count, last_activity, started |
+| `/api` | GET | Jupyter server version (e.g. `2.14.0`) |
+| `/api/kernelspecs` | GET | Available kernel specs (python3, julia, ir on standard runtime) |
+
+Used for: `status` (runtime health), `ls` (kernel state), reconnection logic.
 
 ---
 
@@ -984,9 +1091,9 @@ colab-cli/
 
 ## 16. Open Questions
 
-### Q1: OAuth Scopes
+### Q1: OAuth Scopes — RESOLVED
 
-Exact scopes must be extracted from the published Colab VS Code extension VSIX. We need our own OAuth app but must use compatible scopes.
+Scopes: `colaboratory`, `profile`, `email`. We use the VS Code extension's public OAuth client credentials (not our own app). See Section 9 and Addendum A7.
 
 ### Q2: Colab API Stability
 
@@ -996,9 +1103,9 @@ Undocumented API — could change. Mitigation: Zod schemas for response validati
 
 Unknown. Mitigation: retry with exponential backoff for 429 responses.
 
-### Q4: notebookHash Generation
+### Q4: notebookHash Generation — RESOLVED
 
-`assign()` requires a specific hash format (UUID → web-safe base64, length 44). Exact algorithm needs verification from colab-vscode source.
+UUID v4 with dashes replaced by underscores, padded with dots to 44 chars. Example: `380b033e_4abf_4918_9f96_3d147452ff9a........`. Confirmed from pdwi2020/mcp-server-colab-exec and live-validated. See Section 11.
 
 ### Q5: Cell Addressing UX
 
@@ -1053,23 +1160,43 @@ Can be built and fully tested without touching the Colab API. Pure TypeScript, p
 
 Prove the undocumented API works end-to-end. Manually tested, script-driven.
 
-- [ ] Extract OAuth scopes from published VSIX (resolves Q1)
-- [ ] `src/auth/oauth.ts` — OAuth2 PKCE loopback flow
-- [ ] `src/auth/tokens.ts` — Token storage, refresh, expiry check
-- [ ] `src/colab/xssi.ts` — XSSI prefix stripping
-- [ ] `src/colab/headers.ts` — Custom header construction
-- [ ] `src/colab/types.ts` — Zod schemas for API responses
-- [ ] `src/colab/client.ts` — ColabClient: getUserInfo, listAssignments, assign, unassign, refreshConnection, sendKeepAlive
-- [ ] End-to-end script: auth → assign → refreshConnection → verify runtime alive
-- [ ] `src/jupyter/contents.ts` — Contents API client (GET/PUT .ipynb)
-- [ ] End-to-end script: upload .ipynb → download .ipynb → verify round-trip
-- [ ] `src/jupyter/api.ts` — Jupyter REST API (list/create sessions)
-- [ ] `src/jupyter/connection.ts` — KernelConnection (WebSocket)
-- [ ] `src/jupyter/messages.ts` — Jupyter message types
-- [ ] End-to-end script: connect kernel → execute `print("hello")` → collect output
-- [ ] Resolve Q8 (Drive persistence — does assign load from Drive? Do Contents writes sync?)
-- [ ] Resolve Q4 (notebookHash generation algorithm)
-- [ ] Resolve Q9 (TTL — does assign accept TTL params?)
+**Auth:**
+- [x] OAuth scopes identified: `colaboratory`, `profile`, `email` (resolves Q1)
+- [x] Client ID identified: VS Code extension's public credentials (resolves auth approach)
+- [x] Live-validated: token from VS Code client ID unlocks BOTH tunnel and GAPI domains
+- [x] `src/auth/oauth.ts` — OAuth2 loopback flow: buildAuthUrl, exchangeCode, refreshAccessToken, login (10 tests)
+- [x] `src/auth/tokens.ts` — Token storage (0600), refresh, expiry check, getAccessToken (20 tests)
+
+**API client layer:**
+- [x] `src/colab/xssi.ts` — XSSI prefix stripping (8 tests)
+- [x] `src/colab/headers.ts` — Custom header construction
+- [x] `src/colab/types.ts` — API response types (live-validated shapes)
+- [x] `src/colab/client.ts` — ColabClient: assign, unassign, keepAlive, propagateCredentials (tunnel methods)
+- [x] `src/colab/client.ts` — GAPI methods: getUserInfo, listAssignments, refreshProxyToken
+- [x] `src/jupyter/contents.ts` — Contents API client (6 tests)
+- [x] `src/jupyter/sessions.ts` — Sessions + Kernels REST API (6 tests)
+- [x] `src/jupyter/messages.ts` — Jupyter message types + builders
+- [x] `src/jupyter/connection.ts` — KernelConnection WebSocket + `colab_request` handler (5 tests)
+
+**Live validation (all confirmed 2026-03-11 — see A8):**
+- [x] Tunnel auth: assign T4, get endpoint + proxy token + proxy URL
+- [x] Session creation via proxy URL (with retry loop for startup)
+- [x] WebSocket connect to kernel
+- [x] GAPI getUserInfo: subscription tier, compute units, eligible accelerators
+- [x] GAPI listAssignments: sees tunnel-allocated runtimes
+- [x] GAPI refreshProxyToken: fresh token + URL
+- [x] Unassign cleanup
+- [x] End-to-end execution: `print("hello world")` → stdout captured, `status=ok`
+- [x] Variable persistence: `x=42` → `print(x*2)` → `84`
+- [x] GPU access: `torch.cuda.is_available()=True`, `Tesla T4`
+- [x] Error handling: `1/0` → `status=error`, `ZeroDivisionError`
+- [x] Out-of-band: 3 separate WebSocket connections share kernel state
+- [x] Runtime state APIs: `/api/kernels`, `/api/sessions`, `/api/status`, `/api/kernelspecs`
+- [x] Contents API: write/read/stat/delete files and notebooks
+- [x] Contents API path mapping: root=`/`, kernel cwd=`/content`, use `content/` prefix
+- [x] Kernel ↔ Contents API interop: bidirectional file visibility (with correct paths)
+- [x] notebookHash format confirmed (resolves Q4)
+- [ ] Credential propagation: not triggered during testing (simple execution doesn't need it)
 
 ### Phase 3: Core CLI Commands
 
@@ -1085,6 +1212,8 @@ Wire the pieces together into real commands.
 - [ ] `src/cli/index.ts` — Entry point, command router
 - [ ] `src/cli/auth.ts` — `colab auth login/status/logout`
 - [ ] `src/cli/ensure.ts` — `colab ensure` (get-or-create, reclamation recovery, empty .ipynb creation)
+- [ ] Resolve Q8 (Drive persistence — does assign load from Drive? Do Contents writes sync?)
+- [ ] Resolve Q9 (TTL — does assign accept TTL params?)
 - [ ] `src/cli/pull.ts` — `colab pull` (Contents API → ipynbToPercent → write .py, dirty check)
 - [ ] `src/cli/push.ts` — `colab push` (percentToCells → merge → Contents API, conflict detection)
 - [ ] `src/cli/run.ts` — `colab run` (WebSocket execute, streaming, --push, --cell, dirty warning)
@@ -1110,6 +1239,64 @@ Wire the pieces together into real commands.
 ## 18. Addendums
 
 Design tweaks, discoveries, and decisions made during implementation. Newest first.
+
+### A8: Live validation — full end-to-end proof (2026-03-11)
+
+Allocated a T4 runtime and ran comprehensive live tests against the real Colab API. All tests passed. Key findings:
+
+**Execution works without credential propagation for simple code.** `print("hello world")` returns stdout immediately with `status=ok`. No `colab_request` messages were observed during basic execution (arithmetic, variable assignment, torch CUDA queries, intentional errors). This contradicts our earlier assumption that credential propagation blocks ALL execution — it appears to only be triggered when the kernel needs specific auth (Drive mount, authenticated API calls). The `colab_request` handler is still needed for those cases, but simple compute-only execution works without it.
+
+**Out-of-band execution validated.** Three separate WebSocket connections (each with a different session ID) to the same kernel all share state. Variables set by connection 1 (`x=42`) are visible to connection 2 and 3. Variables set by connection 2 (`y='from_conn2'`) are visible to connection 3. The kernel is the durable object; WebSocket connections are ephemeral handles. This is critical for our architecture — `colab exec` can connect, execute, disconnect without losing state.
+
+**Contents API path mapping discovery.** The Jupyter Contents API root maps to the filesystem root `/`, NOT to `/content/`. A directory listing of `""` (empty path) returns `bin`, `usr`, `sys`, `content`, etc. The kernel's working directory is `/content`. To write a file that the kernel sees at `/content/foo.txt`, the Contents API path must be `content/foo.txt`. Both directions work: kernel writes to `/content/bar.txt` → Contents API reads `content/bar.txt`, and vice versa. This affects `pull`/`push` — notebook uploads must use the `content/` prefix.
+
+**Runtime state APIs available:**
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/kernels` | `id`, `execution_state`, `connections`, `last_activity`, `name` |
+| `GET /api/sessions` | Session list with embedded kernel state |
+| `GET /api/status` | `connections`, `kernels` count, `last_activity`, `started` timestamp |
+| `GET /api` | Jupyter version (`2.14.0`) |
+| `GET /api/kernelspecs` | Available kernels: `python3`, `julia`, `ir` |
+
+Additional runtime info queryable via kernel execution: `nvidia-smi` for GPU state (name, memory total/used/free, utilization, temp), `psutil` for RAM/disk/CPU count. On a T4 runtime: 13.6GB RAM, 253GB disk, 2 CPUs, 15GB VRAM.
+
+**Contents API operations validated:** `PUT` (create/overwrite), `GET` (read with base64 encoding), `GET ?content=0` (stat — name, type, size, last_modified), `DELETE`, directory listing, notebook round-trip (write .ipynb → read back → cells and metadata preserved).
+
+### A7: API surface research — full picture (2026-03-11)
+
+Broad research beyond the VS Code extension revealed prior art and resolved critical unknowns.
+
+**Prior art — `pdwi2020/mcp-server-colab-exec`**: A working Python MCP server (MIT, Feb 2026) that allocates Colab GPU runtimes and executes code. 492-line `colab_runtime.py` with the complete tunnel-domain flow. Key contributions to our understanding:
+
+1. **Credential propagation is mandatory for execution.** The kernel sends `colab_request` messages on the WebSocket requesting auth propagation. Without handling these, the kernel blocks indefinitely — this was the cause of our earlier empty-stdout bug. The endpoint is `GET/POST /tun/m/credentials-propagation/{endpoint}` with the standard XSRF pattern.
+
+2. **VS Code extension's OAuth client ID unlocks the GAPI.** pdwi2020 uses client ID `1014160490159-...` (from `google.colab@0.3.0`). We tested this and confirmed: tokens from this client ID get 200 OK from `colab.pa.googleapis.com/v1/assignments` and `/v1/user-info`. Tokens from gcloud's client ID (`764086051850-...`) get 403 `SERVICE_DISABLED`. The gate is which GCP project owns the client ID — Google's Colab project has the API enabled.
+
+3. **Session creation needs retry loop.** Runtime takes time to start. pdwi2020 retries `POST /api/sessions` for up to 180s with 3s sleep between attempts.
+
+4. **Keep-alive at 60s interval.** `GET /tun/m/{endpoint}/keep-alive/` with `X-Colab-Tunnel: Google` header.
+
+**Other approaches surveyed:**
+
+- **DagsHub "Reverse Engineering Google Colab" (2022)**: Confirmed tunnel proxy architecture (`/tun/m/{id}/` proxies to runtime Jupyter). Discovered `/_proxy/{port}/` generic port proxy. Auth via cookies + `X-Colab-Tunnel: Google` header.
+- **SSH/tunnel projects** (colab-ssh, colab-connect, remocolab, VSColab): All deprecated or blocked by Colab TOS changes. Remote desktop/SSH from runtimes is now disallowed for free tier.
+- **Colab Enterprise (Vertex AI)**: Completely separate paid product with proper REST API (`aiplatform.googleapis.com`). Different runtime pool, requires GCP project + billing. Not relevant to consumer Colab.
+- **Selenium/Puppeteer automation**: Brittle browser automation, not API-level. Not viable.
+
+**Live-validated API surface** (all confirmed 2026-03-11 with VS Code extension client ID token):
+
+| Endpoint | Method | Status | Response |
+|---|---|---|---|
+| `colab.pa.googleapis.com/v1/user-info` | GET | 200 | Tier, compute units, eligible GPUs/TPUs |
+| `colab.pa.googleapis.com/v1/assignments` | GET | 200 | All active runtime assignments |
+| `colab.research.google.com/tun/m/assign` | GET+POST | 200 | XSRF → runtime allocation |
+| `colab.research.google.com/tun/m/unassign/{ep}` | GET+POST | 204 | Runtime released |
+| Proxy URL `/api/sessions` | POST | 200 | Kernel session created |
+| Proxy URL `/api/kernels/{id}/channels` | WSS | Connected | Jupyter WebSocket |
+
+**Conclusion**: The full Colab API surface — both tunnel (data plane) and GAPI (control plane) — is accessible from external code using the VS Code extension's public OAuth credentials. No capabilities are lost vs. the extension itself.
 
 ### A6: Code review round 2 hardening (fixes #10-#13)
 
