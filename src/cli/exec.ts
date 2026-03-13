@@ -31,12 +31,17 @@ export async function execCommand(
 ): Promise<CommandResult<ExecData>> {
   const name = args[0];
   const code = args[1];
+  const timeoutIdx = args.indexOf("--timeout");
+  const timeoutSec = timeoutIdx >= 0 ? parseInt(args[timeoutIdx + 1]!, 10) : 300;
 
   if (!name) {
     return err("exec", "USAGE", "Missing notebook name", 'Usage: colab exec <name> "<code>"');
   }
   if (!code) {
     return err("exec", "USAGE", "Missing code argument", 'Usage: colab exec <name> "print(42)"');
+  }
+  if (timeoutIdx >= 0 && (isNaN(timeoutSec) || timeoutSec <= 0)) {
+    return err("exec", "USAGE", "Invalid --timeout value", "Usage: colab exec <name> \"<code>\" --timeout 300");
   }
 
   // Auth
@@ -97,8 +102,12 @@ export async function execCommand(
   let result: ExecutionResult;
   try {
     await conn.connect();
-    result = await conn.execute(code);
+    result = await conn.execute(code, timeoutSec * 1000);
   } catch (e) {
+    const msg = String(e);
+    if (msg.includes("timed out")) {
+      return err("exec", "TIMEOUT", msg);
+    }
     return err("exec", "ERROR", `Execution failed: ${e}`);
   } finally {
     conn.close();

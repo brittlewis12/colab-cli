@@ -253,6 +253,76 @@ describe("KernelConnection", () => {
     expect(resultPromise).rejects.toThrow("WebSocket closed");
   });
 
+  test("input_request gets auto-replied so kernel unblocks", async () => {
+    resetMocks();
+    const conn = new KernelConnection(
+      "https://proxy.test",
+      "k-1",
+      "ptok",
+      { WebSocket: MockWebSocket as any },
+    );
+    await conn.connect();
+    const ws = MockWebSocket.instances[0]!;
+
+    const resultPromise = conn.execute('x = input("name: ")');
+    const msgId = JSON.parse(ws.sent[0]!).header.msg_id;
+
+    // Kernel sends input_request
+    ws.receive({
+      header: { msg_type: "input_request" },
+      parent_header: { msg_id: msgId },
+      content: { prompt: "name: ", password: false },
+      metadata: {},
+      channel: "stdin",
+    });
+
+    // Verify an input_reply was sent back
+    expect(ws.sent).toHaveLength(2);
+    const reply = JSON.parse(ws.sent[1]!);
+    expect(reply.header.msg_type).toBe("input_reply");
+    expect(reply.content.value).toBe("");
+    expect(reply.channel).toBe("stdin");
+
+    // Complete the execution normally
+    ws.receive({
+      header: { msg_type: "execute_reply" },
+      parent_header: { msg_id: msgId },
+      content: { status: "ok", execution_count: 1 },
+      metadata: {},
+      channel: "shell",
+    });
+    ws.receive({
+      header: { msg_type: "status" },
+      parent_header: { msg_id: msgId },
+      content: { execution_state: "idle" },
+      metadata: {},
+      channel: "iopub",
+    });
+
+    const result = await resultPromise;
+    expect(result.status).toBe("ok");
+
+    conn.close();
+  });
+
+  test("execute times out when timeoutMs is set", async () => {
+    resetMocks();
+    const conn = new KernelConnection(
+      "https://proxy.test",
+      "k-1",
+      "ptok",
+      { WebSocket: MockWebSocket as any },
+    );
+    await conn.connect();
+
+    // Execute with a very short timeout — never send reply
+    const promise = conn.execute("time.sleep(999)", 50);
+
+    expect(promise).rejects.toThrow("timed out");
+
+    conn.close();
+  });
+
   test("messages for unknown parent_id are ignored", async () => {
     resetMocks();
     const conn = new KernelConnection(

@@ -112,13 +112,13 @@ export class KernelConnection {
   }
 
   /** Execute code and collect all outputs. */
-  async execute(code: string): Promise<ExecutionResult> {
+  async execute(code: string, timeoutMs?: number): Promise<ExecutionResult> {
     if (!this.ws) throw new Error("Not connected");
 
     const msg = makeExecuteRequest(code, this.sessionId);
     const msgId = msg.header.msg_id;
 
-    return new Promise<ExecutionResult>((resolve, reject) => {
+    const executionPromise = new Promise<ExecutionResult>((resolve, reject) => {
       this.pending.set(msgId, {
         resolve,
         reject,
@@ -135,6 +135,18 @@ export class KernelConnection {
 
       this.ws!.send(JSON.stringify(msg));
     });
+
+    if (!timeoutMs) return executionPromise;
+
+    return Promise.race([
+      executionPromise,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => {
+          this.pending.delete(msgId);
+          reject(new Error(`Execution timed out after ${timeoutMs}ms`));
+        }, timeoutMs),
+      ),
+    ]);
   }
 
   /** Close the connection. */
@@ -176,6 +188,14 @@ export class KernelConnection {
     // Must be handled or the kernel blocks indefinitely.
     if (msgType === "colab_request") {
       this.handleColabRequest(msg);
+      return;
+    }
+
+    // --- Handle input_request (Python's input()) ---
+    // Reply with an error so the kernel doesn't block forever.
+    // CLI execution is non-interactive; input() cannot be satisfied.
+    if (msgType === "input_request") {
+      this.sendInputReply("", msg);
       return;
     }
 
@@ -337,6 +357,25 @@ export class KernelConnection {
         `${authType} propagation failed: ${err}`,
       );
     }
+  }
+
+  /**
+   * Send an input_reply for Python's input().
+   * We send an empty string — the kernel will unblock and return "".
+   * Callers should handle the subsequent error gracefully.
+   */
+  private sendInputReply(value: string, parentMsg: JupyterMessage): void {
+    if (!this.ws) return;
+
+    const reply: JupyterMessage = {
+      header: makeHeader("input_reply", this.sessionId),
+      parent_header: parentMsg.header,
+      metadata: {},
+      content: { value },
+      channel: "stdin",
+    };
+
+    this.ws.send(JSON.stringify(reply));
   }
 
   /** Send a colab_reply input_reply message on the WebSocket. */

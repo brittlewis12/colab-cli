@@ -132,9 +132,14 @@ export async function runNotebookCommand(
   const pushFirst = args.includes("--push");
   const cellIdx = args.indexOf("--cell");
   const cellRef = cellIdx >= 0 ? args[cellIdx + 1] : undefined;
+  const timeoutIdx = args.indexOf("--timeout");
+  const timeoutSec = timeoutIdx >= 0 ? parseInt(args[timeoutIdx + 1]!, 10) : 300;
 
   if (!name) {
     return err("run", "USAGE", "Missing notebook name", "Usage: colab run <name>");
+  }
+  if (timeoutIdx >= 0 && (isNaN(timeoutSec) || timeoutSec <= 0)) {
+    return err("run", "USAGE", "Invalid --timeout value", "Usage: colab run <name> --timeout 300");
   }
 
   // Auth
@@ -263,7 +268,7 @@ export async function runNotebookCommand(
       const cell = notebook.cells[idx]! as CodeCell;
 
       streamErr(`Running cell ${idx}...`);
-      const result = await conn.execute(cell.source);
+      const result = await conn.execute(cell.source, timeoutSec * 1000);
       results.push({ index: idx, result });
 
       // Update cell outputs and execution_count

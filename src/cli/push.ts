@@ -128,17 +128,17 @@ export async function pushCommand(
     merged = true;
   } else {
     // Fresh notebook from local cells — no merge base
+    const defaultKernelspec = {
+      display_name: "Python 3",
+      language: "python",
+      name: "python3",
+    };
     notebook = {
       nbformat: 4,
       nbformat_minor: 5,
       metadata: {
-        kernelspec: localMetadata.kernelspec ?? {
-          display_name: "Python 3",
-          language: "python",
-          name: "python3",
-        },
-        ...(localMetadata.kernelspec ? {} : localMetadata),
-        ...(localMetadata.kernelspec ? localMetadata : {}),
+        ...localMetadata,
+        kernelspec: localMetadata.kernelspec ?? defaultKernelspec,
       },
       cells: localCells,
     };

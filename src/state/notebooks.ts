@@ -129,10 +129,10 @@ export async function listNotebookNames(
 
 // ── Dirty State ──────────────────────────────────────────────────────────
 
-/** Compute SHA-256 hash of a file's contents. */
+/** Compute SHA-256 hash of a file's contents. Returns `sha256:<hex>`. */
 export async function hashFile(path: string): Promise<string> {
   const content = await readFile(path);
-  return createHash("sha256").update(content).digest("hex");
+  return `sha256:${createHash("sha256").update(content).digest("hex")}`;
 }
 
 /** Check if the local .py has unpushed changes. */
