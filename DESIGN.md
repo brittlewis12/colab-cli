@@ -20,11 +20,15 @@ Colab's actual abstraction is a notebook with a 1:1 runtime. We match that — n
 
 `ensure` not `open`. No default GPU type — the agent must say `--gpu t4` or `--gpu a100` explicitly. GPU allocation costs real money and real time. Making it explicit prevents agents from accidentally burning compute units.
 
-### P3: Remote Is Source of Truth
+### P3: Three-Tier State Model
 
-The .ipynb on Colab is canonical. Colab notebooks persist on Google Drive — they survive runtime reclamation. The runtime is just the ephemeral compute layer; the notebook itself lives beyond it.
+State lives in three places, each with different durability:
 
-The local .py is a working copy for editing. The local `.colab/notebooks/<name>.ipynb` cache is a safety net — updated on every `pull` and `push` — covering the gap between what's on the runtime's working copy and what's been synced to Drive. If anything goes wrong, the local cache plus the .py give you full recovery.
+1. **Runtime** (ephemeral): The `.ipynb` on the runtime filesystem at `/content/`. Lost when the runtime dies. This is the live working copy during a session.
+2. **Local cache** (durable): `.colab/notebooks/<name>.ipynb` and the `.py` working copy. Updated on every `pull` and `push`. Survives runtime death. This is always available for recovery.
+3. **Drive** (durable, optional): If `--drive` is enabled, the `.ipynb` is uploaded to Google Drive after `push` and `run`. Survives everything — visible in Colab UI, shareable, backed by Google infrastructure.
+
+Without Drive, the local cache is the only copy that survives runtime reclamation. With Drive, both local cache and Drive are durable — but Drive can be independently modified or deleted, so the local cache remains the ground truth for the CLI's state tracking.
 
 ### P4: Git-Like Pull/Push Workflow
 
@@ -138,6 +142,12 @@ colab restart <name>               # Restart kernel (preserve runtime)
 colab interrupt <name>             # Cancel running execution
 ```
 
+### Secrets
+
+```
+colab secrets list                      # List available Colab secret key names
+```
+
 ### File Transfer (via Contents API)
 
 ```
@@ -151,19 +161,24 @@ colab download <name> <remote> <local>  # Download file from runtime
 
 ### `colab ensure <name> --gpu <type>`
 
-Get-or-create a notebook with a runtime. Idempotent. Blocks until ready.
+Get-or-create a notebook with a runtime. Idempotent. Blocks until the runtime is *fully ready* — not just assigned, but kernel-accessible.
+
+**Readiness means**: assignment exists, proxy token is obtainable, session creation succeeds, kernel is discoverable via `/api/kernels`. If `ensure` returns 0, the next `exec`/`run`/`push`/`pull` can proceed without waiting.
 
 **Logic**:
 1. Check `.colab/notebooks/<name>.json` for existing notebook
 2. If found AND specs match → verify runtime still alive via `listAssignments()`
-   - If alive → refresh proxy token if needed → return
-   - If dead (reclaimed) → clean up stale state, fall through to step 4
+   - If alive → verify kernel accessible (hit `/api/status` via refreshed proxy token) → return
+   - If `/api/status` fails → runtime is stale, fall through to step 4
+   - If not in `listAssignments()` → reclaimed, fall through to step 4
 3. If found AND specs don't match → error with hint to kill first
-4. If not found → generate notebookHash → `assign(hash, {accelerator})` → poll until assigned → `refreshConnection()` for proxy token → create empty .ipynb on runtime via Contents API → write local state → return
+4. If not found (or reclaimed) → generate notebookHash → `assign(hash, {accelerator})` → wait for session creation with retry loop (up to 180s, 3s interval, matching live-validated startup behavior) → create empty .ipynb at `content/<name>.ipynb` via Contents API → write local state → return
 
-**First-run behavior**: `ensure` creates an empty .ipynb on the runtime (one empty code cell, `python3` kernelspec). This means `pull` immediately after `ensure` gives a minimal .py file. The agent can also skip `pull` and write a .py from scratch — `push` handles the "no prior pull" case (see push logic).
+**First-run behavior**: `ensure` creates an empty .ipynb on the runtime at Contents API path `content/<name>.ipynb` (one empty code cell, `python3` kernelspec). This means `pull` immediately after `ensure` gives a minimal .py file. The agent can also skip `pull` and write a .py from scratch — `push` handles the "no prior pull" case (see push logic).
 
-**Reclamation recovery**: When `ensure` finds stale state pointing to a dead runtime, it creates a fresh runtime. The `notebookHash` is regenerated (it's random, not derived from the name). Stale fields are cleared — `remoteModifiedAt` is reset to null so the next `push` doesn't false-conflict against the dead runtime's timestamps. The next `push` restores the notebook from the local .ipynb cache.
+**Reclamation recovery**: When `ensure` finds stale state pointing to a dead runtime, it creates a fresh runtime. The `notebookHash` is regenerated (it's random, not derived from the name). The next `push` restores the notebook from the local .ipynb cache. If `driveEnabled` was set, re-ensure triggers a fresh Drive consent flow (per-runtime consent does not persist across runtimes — see A9). The cached `driveFileId` is reused so subsequent uploads update the same Drive file. Note: `.colab/` deletion orphans runtimes — there is no way to reconnect to an orphaned runtime by name since the `notebookHash` is random. A `colab adopt` command for binding a name to an existing endpoint may be added in Phase 4.
+
+**Session creation retry**: The runtime takes time to start after `assign()`. Session creation (`POST /api/sessions`) is retried with 3s intervals for up to 180s (validated from pdwi2020 reference and our own live testing). The retry loop is the same mechanism `run`/`exec` use when the kernel isn't yet available.
 
 **Flags**:
 
@@ -174,6 +189,7 @@ Get-or-create a notebook with a runtime. Idempotent. Blocks until ready.
 | `--high-mem` | bool | no | High-memory VM variant |
 | `--ttl` | duration | no, default `2h` | Auto-kill after duration. `0` = no TTL |
 | `--timeout` | seconds | no, default `120` | Max wait for assignment |
+| `--drive` | bool | no | Enable Drive persistence (requires one-time browser consent per runtime, see A9) |
 
 No default GPU. The agent must be explicit about what it needs.
 
@@ -213,7 +229,7 @@ Convert local .py to .ipynb, merge with remote, and upload.
 4. Upload .ipynb via Contents API
 5. Update local state: cached .ipynb, content hash (`pushedHash`), `remoteModifiedAt` from Contents API response
 
-**Conflict detection**: The Contents API `GET /api/contents/{path}` returns a `last_modified` field. On every `pull` and `push`, we store this as `remoteModifiedAt` in `.colab/notebooks/<name>.json`. On push, compare the remote's current `last_modified` to our stored `remoteModifiedAt`. If they differ (remote changed since we last synced), error unless `--force`. On first push (no stored timestamp), skip conflict detection — there's nothing to conflict with.
+**Conflict detection**: Deferred to Phase 4. The `last_modified` timestamp from the Contents API is unreliable for conflict detection (filesystem mtime semantics, clock skew, resets on reclamation). The content-addressed merge already handles the real conflict case — if remote cells changed, the merge algorithm matches by content and preserves the right outputs. Advisory timestamp comparison may be added in Phase 4 if dogfooding surfaces a need for an extra safety net.
 
 **Push-without-pull**: Works. If the agent writes `training.py` from scratch and pushes without ever pulling, push creates the .ipynb from the .py cells with fresh UUIDs and empty outputs. This is the simplest path for agents that don't need to inspect an existing notebook.
 
@@ -222,26 +238,59 @@ Convert local .py to .ipynb, merge with remote, and upload.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--force` | bool | false | Skip conflict detection |
+| `--no-drive` | bool | false | Skip Drive upload even if `driveEnabled` is enabled |
 
 **Safety**: `push --force` skips conflict detection. The merge still preserves outputs where possible.
 
-### `colab run <name>`
+**Drive sync**: If `driveEnabled` is enabled in notebook state, the uploaded `.ipynb` is also synced to Drive after a successful push (see A9). Use `--no-drive` to skip.
 
-Execute cells of the notebook on its runtime.
+### `colab exec <name> "<code>"`
+
+Execute ad-hoc Python on a notebook's runtime. This is the **core execution primitive** — `run` is built on top of it.
 
 **Logic**:
-1. Connect to kernel via WebSocket (see Section 10)
-2. If `--push` flag: push first
-3. If no `--push` and local is dirty: warn (stderr) but proceed (runs remote version)
-4. Execute cells: all cells, or specific cells via `--cell`
-5. Stream outputs as they arrive
-6. Return collected results
+1. Resolve notebook state → get endpoint
+2. Refresh proxy token via `refreshProxyToken(endpoint)`
+3. Get-or-create kernel: `GET /api/sessions` → if none, `POST /api/sessions` (with retry loop) → extract `kernel.id`
+4. Connect WebSocket to kernel (fresh `session_id` per connection — ephemeral, not stored)
+5. Send `execute_request` with the code string
+6. Collect outputs (stdout, stderr, display_data, execute_result, error)
+7. Disconnect WebSocket
+8. Send keep-alive as side effect
+9. Return results
+
+**Design**: Code runs on the kernel, so variables and imports persist across `exec` calls (validated: 3 separate WebSocket connections share kernel state). But the code is not saved to the notebook — it's ephemeral. This is the escape hatch for debugging, inspection, and one-off commands.
+
+**Output persistence**: `exec` does NOT write outputs back to the remote `.ipynb`. Outputs exist only in the CLI's response. This is by design — `exec` is for ephemeral computation, not notebook mutation. (Contrast with `run`, which writes outputs back to the `.ipynb` after execution.)
+
+**Flags**:
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--timeout` | seconds | 300 | Max execution time |
+
+### `colab run <name>`
+
+Execute cells of the notebook on its runtime. Built on top of `exec` — reads cells from the remote `.ipynb`, then sends each cell's source as an `execute_request` sequentially.
+
+**Logic**:
+1. If `--push` flag: push first
+2. If no `--push` and local is dirty: warn (stderr) but proceed (runs remote version)
+3. Fetch remote `.ipynb` from `content/<name>.ipynb` via Contents API → parse cells
+4. Filter cells by `--cell` if specified, otherwise all code cells
+5. For each code cell sequentially: `execute_request` → collect outputs
+6. Stop on first error (default) — `--continue-on-error` deferred to Phase 4
+7. Return collected results for all cells
 
 **Cell addressing** (`--cell <ref>`):
 - Integer: cell index (0-based)
 - String matching a cell title from `# %% <title>`: label-based
 - Cell ID (from .ipynb): ID-based
-- Resolution order: try integer parse, then title match, then ID match
+- Resolution order: try integer parse, then title match, then ID match. Numeric titles are rare; if ambiguity arises, use cell ID.
+
+**Output persistence**: After each cell executes, `run` writes the updated `.ipynb` (with that cell's `outputs` and `execution_count` filled in) back to `content/<name>.ipynb` via Contents API PUT. One atomic write per cell — if the process is killed after cell 3 of 5, outputs for cells 1-3 are already persisted. The cost is N PUTs for N code cells, but N is typically small and each PUT is a small JSON payload. The CLI response also returns outputs inline for immediate agent consumption.
+
+**Why manual orchestration**: There is no "run notebook" API in Jupyter or Colab. Execution is exclusively via WebSocket `execute_request`, cell by cell. Even the Colab UI and VS Code extension do this — the Colab VS Code extension is a thin connection layer that delegates cell-by-cell execution to VS Code's built-in Jupyter extension. The pdwi2020 reference implementation does the same.
 
 **Flags**:
 
@@ -250,12 +299,9 @@ Execute cells of the notebook on its runtime.
 | `--cell` | string | (all cells) | Cell reference (index, title, or ID) |
 | `--push` | bool | false | Push local changes before running |
 | `--timeout` | seconds | 300 | Max execution time per cell |
+| `--no-drive` | bool | false | Skip Drive upload even if `driveEnabled` is enabled |
 
-### `colab exec <name> "<code>"`
-
-Execute ad-hoc Python on a notebook's runtime. This is the escape hatch for debugging, inspection, and one-off commands that don't belong in the notebook.
-
-**Design**: Code runs on the same kernel as `colab run`, so variables and imports are shared. But the code is not saved to the notebook — it's ephemeral.
+**Drive sync**: If `driveEnabled` is enabled, the updated `.ipynb` (with outputs) is synced to Drive after `run` completes — including on `ok: false` (partial outputs from failed runs are valuable for debugging). Use `--no-drive` to skip. See A9.
 
 ### `colab diff <name>`
 
@@ -299,17 +345,17 @@ Upload a local file to the notebook's runtime via Contents API.
 
 **Logic**:
 1. Read local file, base64-encode if binary
-2. `PUT /api/contents/<remote>` with file content
+2. `PUT /api/contents/content/<remote>` with file content (note `content/` prefix — see Section 11 path mapping)
 3. Report bytes transferred
 
-Remote paths are relative to `/content/` (the runtime's working directory). So `colab upload training data.csv data.csv` uploads to `/content/data.csv`.
+Remote paths are user-facing as relative to `/content/` (the runtime's working directory). The CLI transparently prepends `content/` when calling the Contents API. So `colab upload training data.csv data.csv` → Contents API path `content/data.csv` → kernel sees `/content/data.csv`.
 
 ### `colab download <name> <remote> <local>`
 
 Download a file from the notebook's runtime via Contents API.
 
 **Logic**:
-1. `GET /api/contents/<remote>` — returns content (base64 for binary)
+1. `GET /api/contents/content/<remote>` — returns content (base64 for binary, `content/` prefix applied by CLI)
 2. Decode and write to local path
 3. Report bytes transferred
 
@@ -358,10 +404,12 @@ ensure → pull → edit → push → run → pull (to see outputs)
    → Outputs streamed to terminal
    → Results returned (stdout, results, errors)
 
-6. colab pull training
-   → Updated .ipynb (now with outputs) downloaded
-   → Agent can inspect outputs in training.py context
+6. (Optional) Inspect results via exec
+   → colab exec training "print(result)"
+   → Quick variable inspection without pull/push cycle
 ```
+
+After `run`, the remote `.ipynb` is updated with execution outputs (see `run` details). `pull` after `run` downloads the notebook with outputs, so the agent can inspect results in the .py context.
 
 ### Shortcuts
 
@@ -369,7 +417,7 @@ ensure → pull → edit → push → run → pull (to see outputs)
 
 **First time**: `ensure` + `pull` on a new notebook pulls an empty notebook (one empty code cell). Agent adds content, pushes, runs.
 
-**Inspection loop**: After `run`, agent can `pull` to see outputs embedded in the .ipynb (cached locally), or use `colab exec training "print(result)"` for quick checks.
+**Inspection loop**: After `run`, agent uses `colab exec training "print(result)"` for quick variable inspection. Since kernel state persists across connections, variables from `run` are accessible via `exec`.
 
 ---
 
@@ -672,7 +720,7 @@ Messages are JSON text over WebSocket. No binary framing for code execution.
     "code": "print('hello')",
     "silent": false,
     "store_history": true,
-    "allow_stdin": false,
+    "allow_stdin": true,
     "stop_on_error": true
   }
 }
@@ -689,7 +737,7 @@ Messages are JSON text over WebSocket. No binary framing for code execution.
 | iopub | `error` | Python exception | Collect (ename, evalue, traceback) |
 | shell | `execute_reply` | Execution finished | Other half of completion |
 
-**Completion**: Both `execute_reply` (shell) AND `status: idle` (iopub) must arrive with matching `parent_header.msg_id`.
+**Completion**: The Jupyter spec states both `execute_reply` (shell) AND `status: idle` (iopub) should arrive. In practice on Colab, `execute_reply` arrives last and `stream` messages always precede it. However, to be safe against late-arriving iopub messages, the implementation should track both signals and resolve only when `gotReply && gotIdle`. The `gotReply`/`gotIdle` fields exist in the pending map for this purpose — they must be used. Empirically validated in A8: three separate WebSocket connections confirmed `execute_reply` arrives last on Colab.
 
 **Colab-specific — `colab_request` (must be handled when present)**:
 
@@ -710,7 +758,9 @@ GET  /tun/m/credentials-propagation/{endpoint}?authuser=0&authtype={type}&versio
 POST /tun/m/credentials-propagation/{endpoint}  (with XSRF from GET)
 ```
 
-If dry-run returns `unauthorizedRedirectUri`, the auth type requires interactive browser consent (not possible in CLI — send error reply and continue).
+If dry-run returns `unauthorized_redirect_uri` (snake_case — not camelCase), the auth type requires interactive browser consent. For Drive mounts, the CLI can facilitate this by printing the consent URL for the user to open (see A9).
+
+**`allow_stdin` interaction**: `colab_request` arrives on the stdin channel. `allow_stdin: true` must be set in `execute_request` so the kernel sends `colab_request` messages when needed (credential propagation, `GetSecret`). This also means `input_request` messages (Python's `input()`) may arrive — reply with an error so the kernel doesn't block (agents don't do interactive input). Validated empirically: `colab_request` with `GetSecret` confirmed working (A10), Drive credential propagation confirmed working (A9).
 
 ### Connection Lifecycle
 
@@ -753,7 +803,8 @@ Two backend domains, both accessible with the VS Code extension's OAuth client I
 | `refreshProxyToken(endpoint)` | GAPI | Fresh proxy token + URL | long-lived sessions |
 | `assign(nbHash, params)` | Tunnel | Allocate runtime (XSRF) | ensure |
 | `unassign(endpoint)` | Tunnel | Release runtime (XSRF) | kill |
-| `propagateCredentials(endpoint, authType)` | Tunnel | Credential propagation (XSRF) | run, exec |
+| `propagateCredentials(endpoint, authType)` | Tunnel | Credential propagation (XSRF) | ensure --drive, push, run |
+| `listSecrets()` | Tunnel | List user's Colab secrets (`/userdata/list`) | secrets list, exec, run |
 | `listSessions(endpoint)` | Tunnel | Jupyter sessions on runtime | run, exec |
 | `sendKeepAlive(endpoint)` | Tunnel | Prevent idle timeout (~60s interval) | all runtime commands |
 
@@ -901,7 +952,7 @@ Exit code 7 is intentional: agents use exit codes to distinguish "the CLI broke"
 
 ## 13. State Management
 
-### Two State Locations
+### Local State File Layout
 
 **Global** (`~/.config/colab-cli/`):
 ```
@@ -922,25 +973,38 @@ notebooks/
 
 ```json
 {
-  "notebookHash": "base64...",
-  "endpoint": "m-s-kkb4...",
+  "notebookHash": "380b033e_4abf_4918_9f96_3d147452ff9a........",
+  "endpoint": "gpu-t4-s-bcdhjyw4onbe",
   "gpu": "t4",
-  "proxyUrl": "https://m-s-kkb4....colab.sandbox.google.com",
-  "proxyToken": "eyJ...",
-  "proxyTokenExpiresAt": "2026-03-10T13:00:00Z",
-  "kernelId": "fd343487-...",
-  "sessionId": "a1b2c3d4-...",
   "createdAt": "2026-03-10T12:00:00Z",
-  "ttlExpiresAt": "2026-03-10T14:00:00Z",
   "lastKeepAlive": "2026-03-10T12:30:00Z",
   "pushedHash": "sha256:abc123...",
-  "remoteModifiedAt": "2026-03-10T12:35:00Z"
+  "driveEnabled": true,
+  "driveFolderId": "1nHDhKPFLNAZjVcgw43vSPdmPZu6B8ek1",
+  "driveFileId": "1iFe9O8icEenmD49FzyN5R4b1MoRcKRY6"
 }
 ```
 
+**What's NOT persisted (and why):**
+- `proxyUrl`, `proxyToken`, `proxyTokenExpiresAt` — proxy tokens expire after ~1h, refreshed lazily via `refreshProxyToken(endpoint)` from the GAPI. Persisting short-lived tokens creates stale-state and secret-sprawl problems. Instead, every command that needs a proxy token calls `refreshProxyToken()` on demand.
+- `sessionId` — WebSocket `session_id` is an ephemeral per-connection transport detail. Live testing confirmed it doesn't need to match a Jupyter session from `/api/sessions`, and multiple connections with different session IDs all share the same kernel state. Generated fresh at connect time.
+- `kernelId` — discovered dynamically via `GET /api/sessions` or `POST /api/sessions` (with retry). Kernels can restart, reclaim, or change IDs between commands.
+- `remoteModifiedAt` — deferred. Conflict detection via `last_modified` timestamps is fragile (clock skew, mtime semantics). The content-addressed merge already handles the real conflict case. May add advisory timestamp comparison in Phase 4 if dogfooding surfaces a need.
+- `ttlExpiresAt` — deferred pending Q9 resolution.
+
+**What IS persisted:**
+- `notebookHash` — opaque identifier passed to `assign()`. Regenerated on each `ensure` (including reclamation recovery). Persisted so `listAssignments()` can match the current assignment.
+- `endpoint` — needed to find the runtime via `listAssignments()` and `refreshProxyToken()`.
+- `gpu` — needed to verify specs match on `ensure` re-entry.
+- `createdAt`, `lastKeepAlive` — operational metadata.
+- `pushedHash` — SHA-256 of the last-pushed .py, for dirty state tracking.
+- `driveEnabled` — whether `--drive` was requested. Survives reclamation so re-ensure knows to re-trigger Drive consent. Only present when `--drive` is used.
+- `driveFolderId` — the `Colab Notebooks` folder ID in Drive. Discovered on first upload, cached to avoid re-lookup.
+- `driveFileId` — the Drive file ID of the uploaded `.ipynb`. Survives reclamation so subsequent uploads update the same file. Only present after first successful upload.
+
 ### Concurrency
 
-Multiple CLI invocations may run simultaneously (multi-agent). State file access uses advisory file locking (`flock`) on `.colab/notebooks/<name>.json.lock` with 5-second timeout.
+Multiple CLI invocations may run simultaneously (multi-agent). For Phase 3, use atomic writes (write to `.tmp`, rename to final) to prevent partial reads. Advisory file locking (`flock`) deferred to Phase 4 — the real concurrency contention is at the Colab API level (two agents pushing to the same runtime), not local state files.
 
 ---
 
@@ -1036,6 +1100,7 @@ colab-cli/
 │   │   ├── ls.ts                # ls command
 │   │   ├── status.ts            # status command
 │   │   ├── kill.ts              # kill command
+│   │   ├── secrets.ts           # secrets list command
 │   │   ├── restart.ts           # restart command
 │   │   ├── interrupt.ts         # interrupt command
 │   │   └── output.ts            # JSON/human-readable formatting
@@ -1107,21 +1172,21 @@ Unknown. Mitigation: retry with exponential backoff for 429 responses.
 
 UUID v4 with dashes replaced by underscores, padded with dots to 44 chars. Example: `380b033e_4abf_4918_9f96_3d147452ff9a........`. Confirmed from pdwi2020/mcp-server-colab-exec and live-validated. See Section 11.
 
-### Q5: Cell Addressing UX
+### Q5: Cell Addressing UX — RESOLVED
 
-The `--cell <ref>` resolution order (integer → title → ID) may cause ambiguity if a cell title is a number. May need prefix syntax: `#3` for index, `@title` for title, or similar. Needs dogfooding.
+Resolution order: integer → title → ID. Cell IDs are UUIDs so they never collide with integers. The only ambiguity is integer vs. title-that-looks-like-an-integer, which is rare in practice (who names a cell "3"?). If dogfooding surfaces a real problem, add prefix syntax then. Closed as accepted.
 
-### Q6: Multi-Cell Execution Semantics
+### Q6: Multi-Cell Execution Semantics — RESOLVED
 
-When `colab run training` executes all cells: sequential or parallel? Almost certainly sequential (matches Colab's "Run All" behavior). But do we stop on first error or continue? Leaning stop-on-error with `--continue-on-error` flag.
+Sequential execution, stop on first error. Matches Colab's "Run All" behavior and the `stop_on_error: true` already set in `execute_request`. `--continue-on-error` flag deferred to Phase 4. The sequential cell loop in `run` checks the previous cell's result before sending the next.
 
 ### Q7: Streaming Format
 
 Activity commands stream human-readable output by default. What exactly does streaming look like for `colab run` with multiple cells? Need to design the cell-by-cell progress output.
 
-### Q8: Drive Persistence Mechanism
+### Q8: Drive Persistence Mechanism — RESOLVED
 
-`pull`/`push` use the runtime Contents API. We claim Colab/Drive is source of truth, but we don't yet know: does `assign()` with a notebookHash load an existing Drive notebook? Do Contents API writes auto-sync to Drive? Or do we need separate Drive API calls? This determines whether recovery after reclamation uses Drive or only our local cache. Must be answered empirically during Phase 2.
+Contents API writes are runtime-local only — they do NOT sync to Drive. The runtime filesystem at `/content/` is ephemeral and lost when the runtime dies. Drive persistence requires separate Drive REST API calls using credentials obtained through Colab's credential propagation mechanism. See addendum A9 for the full empirical findings and designed solution.
 
 ### Q9: TTL Enforcement
 
@@ -1200,35 +1265,59 @@ Prove the undocumented API works end-to-end. Manually tested, script-driven.
 
 ### Phase 3: Core CLI Commands
 
-Wire the pieces together into real commands.
+Wire the pieces together into real commands. Build order revised per A8 live validation — resolve unknowns first, build the output shell, then commands from simplest to most complex.
 
-- [ ] `src/util/errors.ts` — Error types with codes and hints
-- [ ] `src/util/hash.ts` — Content hashing (SHA-256)
-- [ ] `src/util/ids.ts` — ID generation
-- [ ] `src/util/time.ts` — Duration parsing
-- [ ] `src/state/store.ts` — State file read/write with locking
-- [ ] `src/state/notebooks.ts` — Per-notebook state (project root discovery, .colab/ management)
-- [ ] `src/cli/output.ts` — JSON envelope, human-readable formatting
+**Step 1: Resolve unknowns**
+- [x] Resolve Q8 empirically — Contents API writes are runtime-local only, Drive persistence requires separate REST API calls via credential propagation (see A9).
+- [ ] Resolve Q9 if possible (does assign accept TTL params?) — if not, defer `--ttl` to Phase 4
+
+**Step 2: Output + state scaffolding**
+- [ ] `src/cli/output.ts` — JSON envelope (`CommandResult<T>`), error types with codes + hints, exit code mapping, human-readable formatting. Every command depends on this.
+- [ ] `src/state/store.ts` — State file read/write with atomic rename (write .tmp → rename). No flock.
+- [ ] `src/state/notebooks.ts` — Per-notebook state (project root discovery, .colab/ management, notebook path convention: `content/<name>.ipynb`)
 - [ ] `src/cli/index.ts` — Entry point, command router
+
+**Step 3: Auth command (simplest, validates output pipeline)**
 - [ ] `src/cli/auth.ts` — `colab auth login/status/logout`
-- [ ] `src/cli/ensure.ts` — `colab ensure` (get-or-create, reclamation recovery, empty .ipynb creation)
-- [ ] Resolve Q8 (Drive persistence — does assign load from Drive? Do Contents writes sync?)
-- [ ] Resolve Q9 (TTL — does assign accept TTL params?)
-- [ ] `src/cli/pull.ts` — `colab pull` (Contents API → ipynbToPercent → write .py, dirty check)
-- [ ] `src/cli/push.ts` — `colab push` (percentToCells → merge → Contents API, conflict detection)
-- [ ] `src/cli/run.ts` — `colab run` (WebSocket execute, streaming, --push, --cell, dirty warning)
-- [ ] `src/cli/exec.ts` — `colab exec` (ad-hoc execution, shared kernel)
-- [ ] Dogfood: ensure → pull → edit → push → run cycle works end-to-end
+
+**Step 4: ensure (the critical path)**
+- [ ] `src/cli/ensure.ts` — `colab ensure` (assign + session retry + kernel readiness check + empty .ipynb creation at `content/<name>.ipynb`)
+- [ ] `src/jupyter/lifecycle.ts` — `getOrCreateKernel(proxyUrl, proxyToken)`: list sessions, create if needed (with 180s retry), return kernel ID. Shared by ensure, exec, run, restart, interrupt.
+
+**Step 5: exec (core execution primitive)**
+- [ ] `src/cli/exec.ts` — `colab exec` (connect → execute → disconnect, proxy token refresh, keep-alive side effect)
+- [ ] Fix `KernelConnection` completion: use `gotReply && gotIdle` dual-signal (see Section 10, Completion)
+- [ ] Set `allow_stdin: true` in `makeExecuteRequest` (required for `colab_request` handling — see Section 10, `allow_stdin` interaction)
+
+**Step 6: pull/push (file transfer with correct paths)**
+- [ ] `src/cli/pull.ts` — `colab pull` (Contents API `content/<name>.ipynb` → ipynbToPercent → write .py, dirty check)
+- [ ] `src/cli/push.ts` — `colab push` (percentToCells → merge → Contents API `content/<name>.ipynb`, no timestamp conflict detection — merge handles it)
+- [ ] `src/cli/kill.ts` — `colab kill` (unassign + clean up state)
+
+**Step 7: run (cell selection + sequential exec)**
+- [ ] `src/cli/run.ts` — `colab run` (fetch remote .ipynb, parse cells, sequential execute_request per cell, --push, --cell, stop-on-error)
+
+**Step 8: Dogfood**
+- [ ] Dogfood: ensure → pull → edit → push → run → exec cycle works end-to-end
+- [ ] Dogfood: reclamation recovery (kill, re-ensure, push from cache)
 
 ### Phase 4: Supporting Commands + Polish
 
+- [ ] `src/cli/secrets.ts` — `colab secrets list` (calls `/userdata/list`, returns key names only — see A10)
+- [ ] `GetSecret` handler in `KernelConnection` (env var > Colab API > not found — see A10)
+- [ ] `ensure --drive` — Drive credential propagation + consent polling (see A9)
+- [ ] Drive auto-sync in `push`/`run` — upload `.ipynb` to Drive via runtime exec (see A9)
 - [ ] `src/cli/ls.ts` — `colab ls`
-- [ ] `src/cli/status.ts` — `colab status`
-- [ ] `src/cli/kill.ts` — `colab kill`
+- [ ] `src/cli/status.ts` — `colab status` (include `driveEnabled`/`driveFileId` in output)
 - [ ] `src/cli/diff.ts` — `colab diff`
 - [ ] `src/cli/restart.ts` — `colab restart`
 - [ ] `src/cli/interrupt.ts` — `colab interrupt`
-- [ ] `colab upload` / `colab download`
+- [ ] `colab upload` / `colab download` (with `content/` path prefix)
+- [ ] `colab adopt` — bind a name to an existing endpoint from `listAssignments()` (recovery from `.colab/` deletion)
+- [ ] Advisory conflict detection for push (content hash comparison, not timestamps)
+- [ ] `--continue-on-error` flag for `run`
+- [ ] `--ttl` enforcement (pending Q9 resolution)
+- [ ] File locking (`flock`) if multi-agent concurrency becomes a real problem
 - [ ] SKILL.md (agent-facing guide, written against real CLI)
 - [ ] Corpus regression tests (nightly)
 - [ ] `run` data shape finalized and documented
@@ -1239,6 +1328,115 @@ Wire the pieces together into real commands.
 ## 18. Addendums
 
 Design tweaks, discoveries, and decisions made during implementation. Newest first.
+
+### A10: Colab secrets — empirical findings and design (2026-03-12)
+
+#### Findings
+
+**Colab secrets are retrieved via kernel comms.** `google.colab.userdata.get('KEY')` sends a `blocking_request('GetSecret', {'key': 'KEY'})` over the Jupyter kernel's ZMQ messaging — the same `colab_request` mechanism used by Drive mount and credential propagation. The frontend responds with `{exists: bool, access: bool, payload: string}`. Our `KernelConnection.handleColabRequest` already intercepts `GetSecret` requests (currently replies with "unsupported").
+
+**The `/userdata/list` API returns all secrets.** `GET https://colab.research.google.com/userdata/list?authuser=0&notebookid=<any>` returns every secret the user has stored in Colab, with full payloads. Requires a valid `colaboratory`-scoped OAuth token (our existing auth). Returns 401 without auth.
+
+**The `notebookid` parameter is not validated.** Any non-empty string works — `notebookid=x` returns the same secrets as a real Drive file ID. The `access` field in the response is purely cosmetic (reflects the per-notebook toggle in the Colab UI sidebar); payloads are returned regardless.
+
+**No runtime or Drive dependency.** The API is on `colab.research.google.com`, not the tunnel domain. It works from the local CLI with our existing token. No runtime needed, no Drive auth needed, no extra scopes needed.
+
+#### Designed Flow
+
+**Listing secrets (agent discoverability):**
+
+```
+colab secrets list
+```
+
+Local command — calls `/userdata/list` with the user's OAuth token, returns **key names only** (payloads stripped). Agents use this to discover what secrets are available before writing code that references them.
+
+```json
+{"ok": true, "command": "secrets.list", "data": {"keys": ["HF_TOKEN", "huggingface", "wandb"]}}
+```
+
+**Resolving secrets at execution time (`GetSecret` handler):**
+
+When the kernel sends a `colab_request` with type `GetSecret` during `exec` or `run`:
+
+1. Check environment variables: if `os.environ[key]` exists on the local CLI process, use that value. This allows env var overrides for CI, automation, or non-Colab secrets.
+2. Otherwise, call `/userdata/list?notebookid=_` (cached per-session — one API call covers all `GetSecret` requests for the session).
+3. Reply on the WebSocket with `{exists: true, access: true, payload: "<value>"}` if found, or `{exists: false}` if not.
+
+**Precedence:** env var > Colab API > not found.
+
+**Security properties:**
+- Secret values never appear in CLI output or command results.
+- The `/userdata/list` response is cached in process memory only — never written to disk.
+- Env vars are the caller's responsibility (standard practice for secret injection).
+- The Colab API requires the user's OAuth token, which is already stored in `~/.config/colab-cli/credentials.json`.
+
+#### Design Rationale
+
+We chose **Colab API + env var passthrough** over a local secret store because:
+- We're not a secret manager — env vars are the universal interface, every CI/agent framework speaks them.
+- Zero config for Colab users — existing Colab secrets just work with no re-entry.
+- No new files to secure, no sync to maintain, no dual source of truth.
+- Env var override is the natural escape hatch for all cases (CI, non-Colab secrets, overrides).
+
+#### Note on Drive scope expansion
+
+Adding `drive` scope to our OAuth flow would allow direct Drive uploads from the local CLI (no per-runtime consent), enumeration of existing Colab notebooks, and a simpler upload path. However, the current per-runtime credential propagation approach is more secure — Drive access is transient and requires explicit human action per runtime. This is arguably a feature for a tool that agents use autonomously. The scope can be expanded later if the per-runtime consent proves too painful in practice; the change is backward-compatible.
+
+### A9: Drive persistence — empirical findings and design (2026-03-12)
+
+#### Findings
+
+**Contents API writes are runtime-local, not Drive.** The Jupyter Contents API writes to `/content/` on the runtime filesystem. These files are ephemeral — lost when the runtime dies. There is no automatic sync to Google Drive. Notebooks created via our `push` command are invisible to Colab's web UI.
+
+**`drive.mount()` requires browser-based OAuth consent.** The `google.colab.drive.mount()` function works by: (1) sending a `colab_request` with `authType: dfs_ephemeral` to the frontend, (2) the frontend triggers a browser-based Google OAuth consent flow with Drive-specific scopes, (3) credentials are provisioned onto an ephemeral metadata server at `TBE_EPHEM_CREDS_ADDR` (typically `172.28.0.1:8009`), (4) the DriveFS FUSE binary reads tokens from that metadata server. This is tightly coupled to the Colab frontend — there is no way to skip the browser consent.
+
+**We can facilitate the consent flow from the CLI.** The `propagateCredentials` API endpoint (used by Colab's frontend to handle `colab_request` messages) is accessible with our existing OAuth token. When called, it returns either `{success: true}` (credentials provisioned) or `{success: false, unauthorized_redirect_uri: "<url>"}` (user must consent). The redirect URL uses `response_type=none+gsession` — the browser consent goes entirely through Google's servers to Colab's backend. No tokens flow through the CLI or the chat.
+
+**Drive REST API works with the provisioned token.** After successful credential propagation, the ephemeral metadata server serves OAuth tokens with Drive scopes (`drive`, `drive.activity.readonly`, `drive.photos.readonly`, etc.). These tokens can be used directly with the Google Drive REST API (`googleapis.com/drive/v3/`) from the runtime — no FUSE mount, no DriveFS binary needed.
+
+**Notebook upload to Drive validated.** Uploading a `.ipynb` file with `mimeType: application/vnd.google.colaboratory` to the `Colab Notebooks` folder in Drive makes it visible and openable in Colab's web UI. Outputs are preserved.
+
+**Consent does NOT persist across runtimes.** Each new runtime requires the user to re-consent via the browser. However, Google remembers prior scope grants — the consent screen shows "most of this was already approved" and requires only one click. The redirect URL is unique per propagation call (contains a runtime-specific state token with the endpoint ID).
+
+**Token TTL is ~47 minutes, refreshable.** The ephemeral metadata server token expires but can be refreshed by re-calling `propagateCredentials` (no browser consent needed within the same runtime session). This should be done transparently before each Drive upload.
+
+#### Designed Flow
+
+**Enabling Drive persistence:**
+
+```
+colab ensure train --gpu t4 --drive
+```
+
+1. Allocate runtime normally.
+2. Call `propagateCredentials(endpoint, 'dfs_ephemeral', dry_run=true)`.
+3. If `success: true` → done (shouldn't happen on fresh runtime, but handle it).
+4. If `success: false` → print the `unauthorized_redirect_uri` for the user to open.
+5. Poll `propagateCredentials(endpoint, 'dfs_ephemeral', dry_run=false)` every 3 seconds, timeout 120s.
+6. On `success: true` → store `driveEnabled: true` and `driveFolderId` in notebook state.
+7. On timeout → warn but don't fail the ensure. Runtime is usable without Drive.
+
+**Auto-sync on push/run:**
+
+When `driveEnabled` is set in notebook state, `push` and `run` automatically upload the `.ipynb` to Drive after their primary operation completes. For `run`, this includes failed runs (`ok: false`) — partial outputs from cells that executed before the error are valuable for debugging. The upload path:
+
+1. Re-call `propagateCredentials` to ensure token freshness (handles TTL).
+2. Execute a Python snippet on the runtime that: fetches the token from the ephemeral metadata server, reads the `.ipynb` from `/content/`, and uploads via Drive REST API.
+3. On first upload: create file in `Colab Notebooks` folder, store the Drive `fileId` in notebook state.
+4. On subsequent uploads: update the existing file by ID (PUT, not create).
+5. Upload failure is non-fatal — warn but don't fail the push/run.
+
+`--no-drive` flag on push/run skips the upload.
+
+**Drive upload runs entirely on the runtime.** The token lives on the ephemeral metadata server and is fetched by a Python snippet executed via `exec`. No tokens transit through the local CLI or appear in command output.
+
+#### Constraints and Limitations
+
+- **Per-runtime consent**: Each new runtime requires one browser click. Cannot be automated. Acceptable for the human-in-the-loop `ensure` step.
+- **Drive deletion**: The Drive copy can be independently deleted or modified. The local `.colab/` cache remains ground truth for the CLI. A `colab status` command could detect Drive staleness by comparing the cached fileId against Drive.
+- **No query by name**: We can't look up a Drive notebook by name to "resume" after the local cache is lost. The Drive `fileId` stored in notebook state is the only link. If both the local cache and the runtime die, the Drive copy exists but is orphaned from the CLI's perspective.
+- **Scope limitations**: The Drive token only has Drive-related scopes. It cannot be used for Gemini API, Vertex AI, or other Google services. Those would require separate credential propagation with different auth types.
 
 ### A8: Live validation — full end-to-end proof (2026-03-11)
 
@@ -1270,7 +1468,7 @@ Broad research beyond the VS Code extension revealed prior art and resolved crit
 
 **Prior art — `pdwi2020/mcp-server-colab-exec`**: A working Python MCP server (MIT, Feb 2026) that allocates Colab GPU runtimes and executes code. 492-line `colab_runtime.py` with the complete tunnel-domain flow. Key contributions to our understanding:
 
-1. **Credential propagation is mandatory for execution.** The kernel sends `colab_request` messages on the WebSocket requesting auth propagation. Without handling these, the kernel blocks indefinitely — this was the cause of our earlier empty-stdout bug. The endpoint is `GET/POST /tun/m/credentials-propagation/{endpoint}` with the standard XSRF pattern.
+1. **Credential propagation is mandatory for execution.** *(Partially superseded by A8: credential propagation is only triggered for Drive/authenticated operations, not simple compute-only execution.)* The kernel sends `colab_request` messages on the WebSocket requesting auth propagation. Without handling these, the kernel blocks indefinitely — this was the cause of our earlier empty-stdout bug. The endpoint is `GET/POST /tun/m/credentials-propagation/{endpoint}` with the standard XSRF pattern.
 
 2. **VS Code extension's OAuth client ID unlocks the GAPI.** pdwi2020 uses client ID `1014160490159-...` (from `google.colab@0.3.0`). We tested this and confirmed: tokens from this client ID get 200 OK from `colab.pa.googleapis.com/v1/assignments` and `/v1/user-info`. Tokens from gcloud's client ID (`764086051850-...`) get 403 `SERVICE_DISABLED`. The gate is which GCP project owns the client ID — Google's Colab project has the API enabled.
 

@@ -143,6 +143,22 @@ export class KernelConnection {
     this.ws = null;
   }
 
+  /** Resolve a pending execution when both execute_reply and status:idle have arrived. */
+  private tryResolve(
+    parentId: string,
+    entry: {
+      resolve: (result: ExecutionResult) => void;
+      result: ExecutionResult;
+      gotReply: boolean;
+      gotIdle: boolean;
+    },
+  ): void {
+    if (entry.gotReply && entry.gotIdle) {
+      this.pending.delete(parentId);
+      entry.resolve(entry.result);
+    }
+  }
+
   private handleMessage(data: string): void {
     let msg: JupyterMessage;
     try {
@@ -224,9 +240,17 @@ export class KernelConnection {
             traceback: c.traceback ?? [],
           };
         }
-        // Execute reply is the terminal message — resolve
-        this.pending.delete(parentId);
-        entry.resolve(entry.result);
+        entry.gotReply = true;
+        this.tryResolve(parentId, entry);
+        break;
+      }
+
+      case "status": {
+        const c = content as { execution_state: string };
+        if (c.execution_state === "idle") {
+          entry.gotIdle = true;
+          this.tryResolve(parentId, entry);
+        }
         break;
       }
     }
@@ -280,10 +304,19 @@ export class KernelConnection {
         true,
       );
 
-      if ((dry as Record<string, unknown>).unauthorizedRedirectUri) {
+      const dryResult = dry as Record<string, unknown>;
+      if (dryResult.unauthorized_redirect_uri || dryResult.unauthorizedRedirectUri) {
         this.sendColabReply(
           colabMsgId,
           `${authType} requires interactive browser consent`,
+        );
+        return;
+      }
+
+      if (dryResult.success === false) {
+        this.sendColabReply(
+          colabMsgId,
+          `${authType} propagation denied`,
         );
         return;
       }

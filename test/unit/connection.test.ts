@@ -96,6 +96,14 @@ describe("KernelConnection", () => {
       channel: "shell",
     });
 
+    ws.receive({
+      header: { msg_type: "status" },
+      parent_header: { msg_id: msgId },
+      content: { execution_state: "idle" },
+      metadata: {},
+      channel: "iopub",
+    });
+
     const result = await resultPromise;
     expect(result.status).toBe("ok");
     expect(result.stdout).toBe("hello\n");
@@ -144,6 +152,14 @@ describe("KernelConnection", () => {
       },
       metadata: {},
       channel: "shell",
+    });
+
+    ws.receive({
+      header: { msg_type: "status" },
+      parent_header: { msg_id: msgId },
+      content: { execution_state: "idle" },
+      metadata: {},
+      channel: "iopub",
     });
 
     const result = await resultPromise;
@@ -198,6 +214,14 @@ describe("KernelConnection", () => {
       content: { status: "ok", execution_count: 3 },
       metadata: {},
       channel: "shell",
+    });
+
+    ws.receive({
+      header: { msg_type: "status" },
+      parent_header: { msg_id: msgId },
+      content: { execution_state: "idle" },
+      metadata: {},
+      channel: "iopub",
     });
 
     const result = await resultPromise;
