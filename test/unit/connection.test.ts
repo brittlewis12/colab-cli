@@ -345,4 +345,113 @@ describe("KernelConnection", () => {
 
     conn.close();
   });
+
+  // ── GetSecret handler ───────────────────────────────────────────────
+
+  test("GetSecret resolves from env var first", async () => {
+    resetMocks();
+    process.env.__TEST_SECRET = "env-value";
+    try {
+      const conn = new KernelConnection(
+        "https://proxy.test",
+        "k-1",
+        "ptok",
+        {
+          WebSocket: MockWebSocket as any,
+          secretResolver: async () => ({ exists: true as const, payload: "api-value" }),
+        },
+      );
+      await conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+
+      // Kernel sends GetSecret
+      ws.receive({
+        header: { msg_type: "colab_request" },
+        parent_header: {},
+        metadata: { colab_request_type: "GetSecret", colab_msg_id: 42 },
+        content: { request: { key: "__TEST_SECRET" } },
+        channel: "stdin",
+      });
+
+      // handleGetSecret is async — wait for it to complete
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Should have sent a reply
+      expect(ws.sent).toHaveLength(1);
+      const reply = JSON.parse(ws.sent[0]!);
+      expect(reply.content.value.exists).toBe(true);
+      expect(reply.content.value.payload).toBe("env-value");
+      expect(reply.content.value.colab_msg_id).toBe(42);
+
+      conn.close();
+    } finally {
+      delete process.env.__TEST_SECRET;
+    }
+  });
+
+  test("GetSecret falls back to secretResolver when no env var", async () => {
+    resetMocks();
+    const conn = new KernelConnection(
+      "https://proxy.test",
+      "k-1",
+      "ptok",
+      {
+        WebSocket: MockWebSocket as any,
+        secretResolver: async (key) =>
+          key === "__COLAB_TEST_SECRET_XYZ"
+            ? { exists: true as const, payload: "api_value" }
+            : { exists: false as const },
+      },
+    );
+    await conn.connect();
+    const ws = MockWebSocket.instances[0]!;
+
+    ws.receive({
+      header: { msg_type: "colab_request" },
+      parent_header: {},
+      metadata: { colab_request_type: "GetSecret", colab_msg_id: 7 },
+      content: { request: { key: "__COLAB_TEST_SECRET_XYZ" } },
+      channel: "stdin",
+    });
+
+    // handleGetSecret is async — wait for it to complete
+    await new Promise((r) => setTimeout(r, 10));
+
+    const reply = JSON.parse(ws.sent[0]!);
+    expect(reply.content.value.exists).toBe(true);
+    expect(reply.content.value.payload).toBe("api_value");
+
+    conn.close();
+  });
+
+  test("GetSecret returns exists:false for unknown key", async () => {
+    resetMocks();
+    const conn = new KernelConnection(
+      "https://proxy.test",
+      "k-1",
+      "ptok",
+      {
+        WebSocket: MockWebSocket as any,
+        secretResolver: async () => ({ exists: false as const }),
+      },
+    );
+    await conn.connect();
+    const ws = MockWebSocket.instances[0]!;
+
+    ws.receive({
+      header: { msg_type: "colab_request" },
+      parent_header: {},
+      metadata: { colab_request_type: "GetSecret", colab_msg_id: 99 },
+      content: { request: { key: "__COLAB_NONEXISTENT_XYZ" } },
+      channel: "stdin",
+    });
+
+    // handleGetSecret is async — wait for it to complete
+    await new Promise((r) => setTimeout(r, 10));
+
+    const reply = JSON.parse(ws.sent[0]!);
+    expect(reply.content.value.exists).toBe(false);
+
+    conn.close();
+  });
 });

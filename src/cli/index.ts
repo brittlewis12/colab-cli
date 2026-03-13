@@ -44,6 +44,18 @@ async function runCommand(args: string[]): Promise<CommandResult> {
       const { killCommand } = await import("./kill.ts");
       return killCommand(rest);
     }
+    case "secrets": {
+      const { secretsCommand } = await import("./secrets.ts");
+      return secretsCommand(rest);
+    }
+    case "ls": {
+      const { lsCommand } = await import("./ls.ts");
+      return lsCommand(rest);
+    }
+    case "status": {
+      const { statusCommand } = await import("./status.ts");
+      return statusCommand(rest);
+    }
     case undefined:
     case "--help":
     case "-h":
@@ -75,6 +87,11 @@ function usage(): string {
     "  run <name>                   Execute notebook cells",
     '  exec <name> "<code>"         Execute ad-hoc Python',
     "  kill <name>                  Teardown runtime",
+    "",
+    "Info:",
+    "  ls                           List notebooks + runtime status",
+    "  status [<name>]              Dashboard or notebook details",
+    "  secrets list                 List available Colab secret names",
   ].join("\n");
 }
 

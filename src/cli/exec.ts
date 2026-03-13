@@ -11,6 +11,7 @@ import { getAccessToken } from "../auth/tokens.ts";
 import { ColabClient } from "../colab/client.ts";
 import { KernelConnection, type ExecutionResult } from "../jupyter/connection.ts";
 import { getOrCreateKernel } from "../jupyter/lifecycle.ts";
+import { createSecretResolver } from "../colab/secrets.ts";
 import {
   findProjectRoot,
   loadNotebookState,
@@ -97,6 +98,7 @@ export async function execCommand(
     colabClient: client,
     accessToken: token,
     endpoint: state.endpoint,
+    secretResolver: createSecretResolver(client, token),
   });
 
   let result: ExecutionResult;
