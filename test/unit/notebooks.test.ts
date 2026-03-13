@@ -145,6 +145,14 @@ describe("dirty state", () => {
     expect(await isDirty(tmpDir, "train")).toBe(false);
   });
 
+  test("hashFile returns sha256: prefixed hex", async () => {
+    const pyPath = localPyPath(tmpDir, "train");
+    await writeFile(pyPath, "print('hello')\n");
+    const hash = await hashFile(pyPath);
+    expect(hash).toStartWith("sha256:");
+    expect(hash.slice(7)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   test("isDirty returns false when hash matches", async () => {
     const pyPath = localPyPath(tmpDir, "train");
     await writeFile(pyPath, "print('hello')\n");

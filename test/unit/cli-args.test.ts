@@ -95,6 +95,38 @@ describe("ensure arg validation", () => {
   });
 });
 
+// ── exec --timeout ───────────────────────────────────────────────────────
+
+describe("exec --timeout validation", () => {
+  test("invalid --timeout → USAGE", async () => {
+    const r = await execCommand(["nb", "print(1)", "--timeout", "abc"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("USAGE");
+  });
+
+  test("negative --timeout → USAGE", async () => {
+    const r = await execCommand(["nb", "print(1)", "--timeout", "-5"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("USAGE");
+  });
+});
+
+// ── run --timeout ────────────────────────────────────────────────────────
+
+describe("run --timeout validation", () => {
+  test("invalid --timeout → USAGE", async () => {
+    const r = await runNotebookCommand(["nb", "--timeout", "abc"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("USAGE");
+  });
+
+  test("negative --timeout → USAGE", async () => {
+    const r = await runNotebookCommand(["nb", "--timeout", "-5"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("USAGE");
+  });
+});
+
 // ── auth ─────────────────────────────────────────────────────────────────
 
 describe("auth arg validation", () => {

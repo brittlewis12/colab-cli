@@ -64,7 +64,6 @@ async function authLogin(): Promise<CommandResult<LoginData>> {
   try {
     const client = new ColabClient();
     const userInfo = await client.getUserInfo(tokens.access_token);
-    stored.email = userInfo.subscriptionTier; // We'll fetch email separately
     data.tier = userInfo.subscriptionTier;
 
     // Try to get email from userinfo endpoint

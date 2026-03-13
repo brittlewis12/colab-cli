@@ -175,6 +175,47 @@ afterEach(async () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ── Auth ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { authCommand } from "../../src/cli/auth.ts";
+
+describe("auth status", () => {
+  test("email field is not corrupted by subscription tier", async () => {
+    // Write creds with a real email
+    await fsWriteFile(
+      CREDS_PATH,
+      JSON.stringify({
+        ...makeCreds(),
+        email: "user@example.com",
+      }),
+    );
+
+    // Mock: getUserInfo returns tier, userinfo endpoint fails
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/v1/user-info")) {
+        return new Response(
+          JSON.stringify({
+            subscriptionTier: "SUBSCRIPTION_TIER_PRO",
+            eligibleAccelerators: [],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("Error", { status: 500 });
+    }) as any;
+
+    const r = await authCommand(["status"]);
+    expect(r.ok).toBe(true);
+    const data = r.data as { email?: string; tier?: string };
+    // Email should be from stored creds, NOT the tier string
+    expect(data.email).toBe("user@example.com");
+    expect(data.tier).toBe("SUBSCRIPTION_TIER_PRO");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ── Kill ─────────────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -265,11 +306,11 @@ describe("pull command", () => {
     );
     expect(cached.cells).toHaveLength(1);
 
-    // pushedHash set (clean)
+    // pushedHash set with sha256: prefix (clean)
     const state = JSON.parse(
       await fsReadFile(join(tmpDir, ".colab", "notebooks", "train.json"), "utf-8"),
     );
-    expect(state.pushedHash).toBeDefined();
+    expect(state.pushedHash).toStartWith("sha256:");
   });
 
   test("returns NOT_FOUND when runtime is gone", async () => {

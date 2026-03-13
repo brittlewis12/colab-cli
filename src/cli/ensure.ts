@@ -8,7 +8,7 @@
 import { ok, err, streamErr, type CommandResult } from "./output.ts";
 import { getAccessToken } from "../auth/tokens.ts";
 import { ColabClient } from "../colab/client.ts";
-import { notebookHash, Variant } from "../colab/types.ts";
+import { notebookHash, Variant, Shape } from "../colab/types.ts";
 import { ContentsClient } from "../jupyter/contents.ts";
 import { getOrCreateKernel } from "../jupyter/lifecycle.ts";
 import {
@@ -81,6 +81,7 @@ export async function ensureCommand(
   const name = args[0];
   const gpuIdx = args.indexOf("--gpu");
   const gpuArg = gpuIdx >= 0 ? args[gpuIdx + 1] : undefined;
+  const highMem = args.includes("--high-mem");
 
   if (!name) {
     return err("ensure", "USAGE", "Missing notebook name", "Usage: colab ensure <name> --gpu <type>");
@@ -100,10 +101,14 @@ export async function ensureCommand(
   const client = new ColabClient();
 
   // Resolve GPU against user's eligible accelerators
-  let gpuSpec: { variant: Variant; accelerator: string };
+  let gpuSpec: { variant: Variant; accelerator: string; shape?: Shape };
   try {
     const resolved = await resolveGpu(client, token, gpuArg);
-    gpuSpec = { variant: resolved.variant, accelerator: resolved.accelerator };
+    gpuSpec = {
+      variant: resolved.variant,
+      accelerator: resolved.accelerator,
+      ...(highMem ? { shape: Shape.HIGHMEM } : {}),
+    };
   } catch (e) {
     if (e instanceof GpuError) {
       const hint = e.eligible.length > 0
@@ -175,6 +180,7 @@ export async function ensureCommand(
       notebookHash: nbh,
       variant: gpuSpec.variant,
       accelerator: gpuSpec.accelerator,
+      shape: gpuSpec.shape,
     });
   } catch (e) {
     const msg = String(e);
@@ -221,6 +227,7 @@ export async function ensureCommand(
     cells: [
       {
         cell_type: "code",
+        id: crypto.randomUUID().replace(/-/g, "").slice(0, 8),
         source: "",
         metadata: {},
         outputs: [],
