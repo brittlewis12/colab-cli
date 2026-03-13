@@ -283,6 +283,33 @@ export class ColabClient {
     );
   }
 
+  // --- Secrets ---
+
+  /**
+   * List all Colab secrets for the user.
+   * Returns key names and payloads. Caller should strip payloads before
+   * exposing to agents.
+   *
+   * Endpoint: GET /userdata/list?authuser=0&notebookid=_
+   * notebookid is not validated — any non-empty string works.
+   */
+  async listSecrets(
+    token: string,
+  ): Promise<Array<{ key: string; payload: string; access: boolean }>> {
+    const url = new URL("/userdata/list", this.colabDomain);
+    url.searchParams.set("authuser", "0");
+    url.searchParams.set("notebookid", "_");
+
+    const res = await this.fetch(url.toString(), {
+      headers: colabHeaders(token),
+    });
+    if (!res.ok) {
+      throw new ColabApiError(res.status, await res.text(), "/userdata/list");
+    }
+    // Response is standard JSON (no XSSI prefix)
+    return (await res.json()) as Array<{ key: string; payload: string; access: boolean }>;
+  }
+
   // --- Keep-Alive ---
 
   async keepAlive(token: string, endpoint: string): Promise<void> {

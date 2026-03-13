@@ -12,6 +12,7 @@ import { ColabClient } from "../colab/client.ts";
 import { ContentsClient } from "../jupyter/contents.ts";
 import { KernelConnection, type ExecutionResult } from "../jupyter/connection.ts";
 import { getOrCreateKernel } from "../jupyter/lifecycle.ts";
+import { createSecretResolver } from "../colab/secrets.ts";
 import { parseIpynb, serializeIpynb } from "../notebook/ipynb.ts";
 import {
   findProjectRoot,
@@ -256,6 +257,7 @@ export async function runNotebookCommand(
     colabClient: client,
     accessToken: token,
     endpoint: state.endpoint,
+    secretResolver: createSecretResolver(client, token),
   });
 
   const results: CellResult[] = [];

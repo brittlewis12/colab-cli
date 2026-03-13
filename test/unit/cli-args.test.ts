@@ -14,6 +14,8 @@ import { runNotebookCommand } from "../../src/cli/run.ts";
 import { execCommand } from "../../src/cli/exec.ts";
 import { ensureCommand } from "../../src/cli/ensure.ts";
 import { authCommand } from "../../src/cli/auth.ts";
+import { secretsCommand } from "../../src/cli/secrets.ts";
+import { statusCommand } from "../../src/cli/status.ts";
 
 // ── kill ─────────────────────────────────────────────────────────────────
 
@@ -122,6 +124,23 @@ describe("run --timeout validation", () => {
 
   test("negative --timeout → USAGE", async () => {
     const r = await runNotebookCommand(["nb", "--timeout", "-5"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("USAGE");
+  });
+});
+
+// ── secrets ──────────────────────────────────────────────────────────────
+
+describe("secrets arg validation", () => {
+  test("no subcommand → USAGE", async () => {
+    const r = await secretsCommand([]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("USAGE");
+    expect(r.command).toBe("secrets");
+  });
+
+  test("unknown subcommand → USAGE", async () => {
+    const r = await secretsCommand(["bogus"]);
     expect(r.ok).toBe(false);
     expect(r.error!.code).toBe("USAGE");
   });

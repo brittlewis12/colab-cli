@@ -21,6 +21,9 @@ import { pullCommand } from "../../src/cli/pull.ts";
 import { pushCommand } from "../../src/cli/push.ts";
 import { execCommand } from "../../src/cli/exec.ts";
 import { runNotebookCommand } from "../../src/cli/run.ts";
+import { secretsCommand } from "../../src/cli/secrets.ts";
+import { lsCommand } from "../../src/cli/ls.ts";
+import { statusCommand } from "../../src/cli/status.ts";
 
 // ── Shared Setup ─────────────────────────────────────────────────────────
 
@@ -531,5 +534,185 @@ describe("run command", () => {
     expect(r.ok).toBe(false);
     expect(r.error!.code).toBe("NOT_FOUND");
     expect(r.error!.message).toContain("999");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Secrets ──────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("secrets command", () => {
+  test("secrets list returns key names only (no payloads)", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      // userdata/list API
+      if (url.includes("/userdata/list")) {
+        return new Response(
+          JSON.stringify([
+            { key: "HF_TOKEN", payload: "hf_secret123", access: true },
+            { key: "WANDB_KEY", payload: "wandb_secret456", access: false },
+          ]),
+          { status: 200 },
+        );
+      }
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await secretsCommand(["list"]);
+    expect(r.ok).toBe(true);
+    expect(r.command).toBe("secrets.list");
+    const data = r.data as { keys: string[] };
+    expect(data.keys).toEqual(["HF_TOKEN", "WANDB_KEY"]);
+    // Verify payloads are NOT in the response
+    expect(JSON.stringify(r)).not.toContain("hf_secret123");
+    expect(JSON.stringify(r)).not.toContain("wandb_secret456");
+  });
+
+  test("secrets list returns empty array when no secrets", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/userdata/list")) {
+        return new Response("[]", { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await secretsCommand(["list"]);
+    expect(r.ok).toBe(true);
+    expect((r.data as { keys: string[] }).keys).toEqual([]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Ls ───────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("ls command", () => {
+  test("returns empty when no notebooks exist", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/v1/assignments")) {
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await lsCommand([]);
+    expect(r.ok).toBe(true);
+    const data = r.data as { notebooks: unknown[]; unmanaged: unknown[] };
+    expect(data.notebooks).toEqual([]);
+    expect(data.unmanaged).toEqual([]);
+  });
+
+  test("merges local state with live assignments", async () => {
+    await writeState("train", makeState());
+    await writeState("eval", makeState({ endpoint: "gpu-t4-s-other", gpu: "a100" }));
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/v1/assignments")) {
+        return new Response(
+          JSON.stringify({
+            assignments: [
+              { endpoint: "gpu-t4-s-test123", accelerator: "T4" },
+              { endpoint: "gpu-unmanaged-xyz", accelerator: "L4" },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await lsCommand([]);
+    expect(r.ok).toBe(true);
+    const data = r.data as { notebooks: any[]; unmanaged: any[] };
+
+    // train is running (endpoint matches), eval is stopped
+    const train = data.notebooks.find((n: any) => n.name === "train");
+    const evalNb = data.notebooks.find((n: any) => n.name === "eval");
+    expect(train.status).toBe("running");
+    expect(evalNb.status).toBe("stopped");
+
+    // Unmanaged runtime detected
+    expect(data.unmanaged).toEqual([
+      { endpoint: "gpu-unmanaged-xyz", accelerator: "L4" },
+    ]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Status ───────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("status command", () => {
+  test("dashboard (no args) returns auth + notebooks", async () => {
+    await writeState("train", makeState());
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/v1/user-info")) {
+        return new Response(
+          JSON.stringify({
+            subscriptionTier: "SUBSCRIPTION_TIER_PRO",
+            paidComputeUnitsBalance: 85.5,
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/v1/assignments")) {
+        return new Response(
+          JSON.stringify({
+            assignments: [{ endpoint: "gpu-t4-s-test123", accelerator: "T4" }],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await statusCommand([]);
+    expect(r.ok).toBe(true);
+    const data = r.data as any;
+    expect(data.auth.loggedIn).toBe(true);
+    expect(data.auth.tier).toBe("SUBSCRIPTION_TIER_PRO");
+    expect(data.auth.computeUnits).toBe(85.5);
+    expect(data.notebooks).toHaveLength(1);
+    expect(data.notebooks[0].status).toBe("running");
+  });
+
+  test("notebook status returns NOT_FOUND for unknown notebook", async () => {
+    const r = await statusCommand(["nonexistent"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("NOT_FOUND");
+  });
+
+  test("notebook status returns dirty state and runtime status", async () => {
+    await writeState("train", makeState());
+    await fsWriteFile(join(tmpDir, "train.py"), "# unpushed\n");
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/v1/assignments")) {
+        return new Response(
+          JSON.stringify({
+            assignments: [{ endpoint: "gpu-t4-s-test123", accelerator: "T4" }],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/keep-alive/")) {
+        return new Response("", { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await statusCommand(["train"]);
+    expect(r.ok).toBe(true);
+    const data = r.data as any;
+    expect(data.name).toBe("train");
+    expect(data.status).toBe("running");
+    expect(data.dirty).toBe(true);
+    expect(data.gpu).toBe("t4");
   });
 });

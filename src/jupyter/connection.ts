@@ -30,6 +30,9 @@ export interface ExecutionResult {
   };
 }
 
+/** Resolves a secret key to its value. Injected by the CLI layer. */
+export type SecretResolver = (key: string) => Promise<{ exists: true; payload: string } | { exists: false }>;
+
 export interface KernelConnectionOptions {
   /** WebSocket constructor override for testing. */
   WebSocket?: typeof WebSocket;
@@ -39,6 +42,8 @@ export interface KernelConnectionOptions {
   accessToken?: string;
   /** Runtime endpoint (required for credential propagation). */
   endpoint?: string;
+  /** Secret resolver for GetSecret colab_requests. */
+  secretResolver?: SecretResolver;
 }
 
 export class KernelConnection {
@@ -60,6 +65,7 @@ export class KernelConnection {
   private readonly colabClient?: ColabClient;
   private readonly accessToken?: string;
   private readonly endpoint?: string;
+  private readonly secretResolver?: SecretResolver;
 
   constructor(
     proxyUrl: string,
@@ -75,6 +81,7 @@ export class KernelConnection {
     this.colabClient = opts.colabClient;
     this.accessToken = opts.accessToken;
     this.endpoint = opts.endpoint;
+    this.secretResolver = opts.secretResolver;
   }
 
   /** Open the WebSocket connection. */
@@ -287,7 +294,17 @@ export class KernelConnection {
     const requestType = metadata.colab_request_type as string | undefined;
     const colabMsgId = metadata.colab_msg_id as string | number | undefined;
 
-    if (requestType !== "request_auth" || colabMsgId == null) {
+    if (colabMsgId == null) {
+      return; // Malformed — no way to reply
+    }
+
+    // GetSecret: google.colab.userdata.get('KEY')
+    if (requestType === "GetSecret") {
+      this.handleGetSecret(msg, colabMsgId);
+      return;
+    }
+
+    if (requestType !== "request_auth") {
       // Unknown request type — send error reply so kernel unblocks
       this.sendColabReply(colabMsgId, `unsupported colab_request type: ${requestType}`);
       return;
@@ -309,6 +326,76 @@ export class KernelConnection {
 
     // Propagate credentials asynchronously
     this.propagateAndReply(authType, colabMsgId);
+  }
+
+  /**
+   * Handle GetSecret colab_request.
+   *
+   * Precedence: env var > Colab API (via secretResolver) > not found.
+   * Reply format: {exists: bool, access: bool, payload: string}
+   */
+  private async handleGetSecret(
+    msg: JupyterMessage,
+    colabMsgId: string | number,
+  ): Promise<void> {
+    const content = msg.content as Record<string, unknown>;
+    const request = content.request as Record<string, unknown> | undefined;
+    const key = String(request?.key ?? "");
+
+    if (!key) {
+      this.sendGetSecretReply(colabMsgId, false);
+      return;
+    }
+
+    // 1. Check environment variables first
+    const envValue = process.env[key];
+    if (envValue !== undefined) {
+      this.sendGetSecretReply(colabMsgId, true, envValue);
+      return;
+    }
+
+    // 2. Try secretResolver (Colab API)
+    if (this.secretResolver) {
+      try {
+        const result = await this.secretResolver(key);
+        if (result.exists) {
+          this.sendGetSecretReply(colabMsgId, true, result.payload);
+          return;
+        }
+      } catch {
+        // Fall through to not found
+      }
+    }
+
+    // 3. Not found
+    this.sendGetSecretReply(colabMsgId, false);
+  }
+
+  /** Send a GetSecret reply on the WebSocket. */
+  private sendGetSecretReply(
+    colabMsgId: string | number,
+    exists: boolean,
+    payload?: string,
+  ): void {
+    if (!this.ws) return;
+
+    const value: Record<string, unknown> = {
+      type: "colab_reply",
+      colab_msg_id: colabMsgId,
+      ...(exists
+        ? { exists: true, access: true, payload: payload ?? "" }
+        : { exists: false }),
+    };
+
+    const reply: JupyterMessage = {
+      header: makeHeader("input_reply", this.sessionId),
+      parent_header: {},
+      metadata: {},
+      content: { value },
+      channel: "stdin",
+    };
+
+    this.ws.send(JSON.stringify(reply));
   }
 
   private async propagateAndReply(

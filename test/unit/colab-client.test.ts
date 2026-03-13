@@ -322,3 +322,81 @@ describe("ColabClient", () => {
     }
   });
 });
+
+// ── listSecrets ──────────────────────────────────────────────────────────
+
+describe("listSecrets", () => {
+  test("returns secrets from /userdata/list", async () => {
+    const { fetch } = mockFetch([
+      {
+        body: [
+          { key: "HF_TOKEN", payload: "hf_xxx", access: true },
+          { key: "WANDB", payload: "wb_yyy", access: false },
+        ],
+      },
+    ]);
+
+    const client = new ColabClient({
+      colabDomain: "https://colab.test",
+      fetch,
+    });
+
+    const secrets = await client.listSecrets("tok-123");
+    expect(secrets).toHaveLength(2);
+    expect(secrets[0]!.key).toBe("HF_TOKEN");
+    expect(secrets[1]!.key).toBe("WANDB");
+  });
+
+  test("throws on auth failure", async () => {
+    const { fetch } = mockFetch([{ status: 401, body: "Unauthorized" }]);
+
+    const client = new ColabClient({
+      colabDomain: "https://colab.test",
+      fetch,
+    });
+
+    expect(client.listSecrets("bad-tok")).rejects.toThrow(ColabApiError);
+  });
+});
+
+// ── createSecretResolver ─────────────────────────────────────────────────
+
+import { createSecretResolver } from "../../src/colab/secrets.ts";
+
+describe("createSecretResolver", () => {
+  test("caches API call — only one fetch for multiple lookups", async () => {
+    let fetchCount = 0;
+    const { fetch } = mockFetch([
+      {
+        body: [
+          { key: "A", payload: "val_a", access: true },
+          { key: "B", payload: "val_b", access: true },
+        ],
+      },
+    ]);
+
+    const wrappedFetch = (async (...args: any[]) => {
+      fetchCount++;
+      return (fetch as any)(...args);
+    }) as typeof globalThis.fetch;
+
+    const client = new ColabClient({
+      colabDomain: "https://colab.test",
+      fetch: wrappedFetch,
+    });
+
+    const resolve = createSecretResolver(client, "tok");
+
+    const a = await resolve("A");
+    expect(a).toEqual({ exists: true, payload: "val_a" });
+
+    const b = await resolve("B");
+    expect(b).toEqual({ exists: true, payload: "val_b" });
+
+    const c = await resolve("C");
+    expect(c).toEqual({ exists: false });
+
+    // Only one API call despite three lookups
+    expect(fetchCount).toBe(1);
+  });
+});
