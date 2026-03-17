@@ -6,7 +6,7 @@
  * across calls.
  */
 
-import { ok, err, type CommandResult } from "./output.ts";
+import { ok, err, ensureFlag, type CommandResult } from "./output.ts";
 import { getAccessToken } from "../auth/tokens.ts";
 import { ColabClient } from "../colab/client.ts";
 import { KernelConnection, type ExecutionResult } from "../jupyter/connection.ts";
@@ -16,6 +16,7 @@ import {
   findProjectRoot,
   loadNotebookState,
   saveNotebookState,
+  isValidNotebookName,
 } from "../state/notebooks.ts";
 
 // ── Exec data shape ──────────────────────────────────────────────────────
@@ -37,6 +38,9 @@ export async function execCommand(
 
   if (!name) {
     return err("exec", "USAGE", "Missing notebook name", 'Usage: colab exec <name> "<code>"');
+  }
+  if (!isValidNotebookName(name)) {
+    return err("exec", "USAGE", `Invalid notebook name: "${name}". Names must start with a letter or digit and contain only alphanumerics, hyphens, underscores, and dots.`);
   }
   if (!code) {
     return err("exec", "USAGE", "Missing code argument", 'Usage: colab exec <name> "print(42)"');
@@ -61,7 +65,7 @@ export async function execCommand(
       "exec",
       "NOT_FOUND",
       `No notebook "${name}" found`,
-      `Run: colab ensure ${name} --gpu t4`,
+      `Run: colab ensure ${name} --gpu t4  (or --tpu, --cpu-only)`,
     );
   }
 
@@ -78,7 +82,7 @@ export async function execCommand(
       "exec",
       "NOT_FOUND",
       `Runtime for "${name}" is no longer available: ${e}`,
-      `Run: colab ensure ${name} --gpu ${state.gpu}`,
+      `Run: colab ensure ${name} ${ensureFlag(state.variant, state.accelerator, state.highMem)}`,
     );
   }
 
@@ -108,7 +112,14 @@ export async function execCommand(
   } catch (e) {
     const msg = String(e);
     if (msg.includes("timed out")) {
-      return err("exec", "TIMEOUT", msg);
+      // Client wait budget exceeded — do NOT interrupt the kernel.
+      // Remote execution may still be running and doing useful work.
+      return err(
+        "exec",
+        "TIMEOUT",
+        `Client wait timeout: ${msg}`,
+        `Remote execution may still be running. Use: colab status ${name}  # check kernelState, then: colab interrupt ${name}  # to cancel`,
+      );
     }
     return err("exec", "ERROR", `Execution failed: ${e}`);
   } finally {

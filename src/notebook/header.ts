@@ -36,15 +36,6 @@ function serializeKernelspec(ks: KernelSpec): string[] {
   ];
 }
 
-function serializeLanguageInfo(li: LanguageInfo): string[] {
-  const lines: string[] = ["#   language_info:"];
-  lines.push(`#     name: ${yamlScalar(li.name)}`);
-  if (li.version !== undefined) {
-    lines.push(`#     version: ${yamlScalar(li.version)}`);
-  }
-  return lines;
-}
-
 /**
  * Serialize notebook metadata to a YAML header string (including the --- delimiters).
  * kernelspec is always first. language_info is omitted by default (jupytext behavior).

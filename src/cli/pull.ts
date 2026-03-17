@@ -5,7 +5,7 @@
  * Caches the .ipynb locally for merge on push.
  */
 
-import { ok, err, streamErr, type CommandResult } from "./output.ts";
+import { ok, err, streamErr, ensureFlag, type CommandResult } from "./output.ts";
 import { getAccessToken } from "../auth/tokens.ts";
 import { ColabClient } from "../colab/client.ts";
 import { ContentsClient } from "../jupyter/contents.ts";
@@ -20,6 +20,7 @@ import {
   cachePath,
   hashFile,
   isDirty,
+  isValidNotebookName,
 } from "../state/notebooks.ts";
 import { writeFile, mkdir } from "fs/promises";
 import { dirname } from "path";
@@ -43,6 +44,9 @@ export async function pullCommand(
   if (!name) {
     return err("pull", "USAGE", "Missing notebook name", "Usage: colab pull <name>");
   }
+  if (!isValidNotebookName(name)) {
+    return err("pull", "USAGE", `Invalid notebook name: "${name}". Names must start with a letter or digit and contain only alphanumerics, hyphens, underscores, and dots.`);
+  }
 
   // Auth
   let token: string;
@@ -60,7 +64,7 @@ export async function pullCommand(
       "pull",
       "NOT_FOUND",
       `No notebook "${name}" found`,
-      `Run: colab ensure ${name} --gpu t4`,
+      `Run: colab ensure ${name} --gpu t4  (or --tpu, --cpu-only)`,
     );
   }
 
@@ -87,7 +91,7 @@ export async function pullCommand(
       "pull",
       "NOT_FOUND",
       `Runtime for "${name}" is no longer available: ${e}`,
-      `Run: colab ensure ${name} --gpu ${state.gpu}`,
+      `Run: colab ensure ${name} ${ensureFlag(state.variant, state.accelerator, state.highMem)}`,
     );
   }
 
@@ -101,7 +105,7 @@ export async function pullCommand(
       "pull",
       "NOT_FOUND",
       `Could not fetch notebook from runtime: ${e}`,
-      `Run: colab ensure ${name} --gpu ${state.gpu}`,
+      `Run: colab ensure ${name} ${ensureFlag(state.variant, state.accelerator, state.highMem)}`,
     );
   }
 
@@ -118,17 +122,14 @@ export async function pullCommand(
   await mkdir(dirname(cache), { recursive: true });
   await writeFile(cache, ipynbJson, "utf-8");
 
-  // Update pushedHash (marks as clean)
+  // Update pushedHash (marks as clean) + keep-alive — single state save
   const hash = await hashFile(pyPath);
   state.pushedHash = hash;
-  await saveNotebookState(projectRoot, name, state);
-
-  // Keep-alive side effect
   try {
     await client.keepAlive(token, state.endpoint);
     state.lastKeepAlive = new Date().toISOString();
-    await saveNotebookState(projectRoot, name, state);
   } catch { /* non-fatal */ }
+  await saveNotebookState(projectRoot, name, state);
 
   streamErr(`Pulled ${name} → ${name}.py (${notebook.cells.length} cells)`);
 

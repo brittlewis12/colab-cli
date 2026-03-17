@@ -20,7 +20,7 @@ import {
 
 interface NotebookEntry {
   name: string;
-  gpu: string;
+  accelerator: string;
   endpoint: string;
   status: "running" | "stopped" | "unknown";
   createdAt: string;
@@ -51,8 +51,10 @@ export async function lsCommand(
   // Fetch live assignments
   const client = new ColabClient();
   let assignments: GapiAssignment[] = [];
+  let assignmentsFetched = false;
   try {
     assignments = await client.listAssignments(token);
+    assignmentsFetched = true;
   } catch {
     // Non-fatal — we'll mark all as "unknown"
   }
@@ -70,9 +72,9 @@ export async function lsCommand(
 
     notebooks.push({
       name,
-      gpu: state.gpu,
+      accelerator: state.accelerator,
       endpoint: state.endpoint,
-      status: liveEndpoints.has(state.endpoint) ? "running" : "stopped",
+      status: !assignmentsFetched ? "unknown" : liveEndpoints.has(state.endpoint) ? "running" : "stopped",
       createdAt: state.createdAt,
       lastKeepAlive: state.lastKeepAlive,
     });

@@ -115,8 +115,8 @@ describe("getOrCreateKernel", () => {
     try {
       await expect(
         getOrCreateKernel("https://proxy.test", "tok", {
-          timeout: 100,
-          interval: 20,
+          timeout: 30,
+          interval: 5,
         }),
       ).rejects.toThrow("not ready");
     } finally {

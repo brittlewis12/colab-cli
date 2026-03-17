@@ -96,8 +96,35 @@ export function exitCode(code: ErrorCode): number {
 
 // ── Output Helpers ───────────────────────────────────────────────────────
 
-/** Write a CommandResult as JSON to stdout and return the exit code. */
-export function outputJson<T>(result: CommandResult<T>): number {
+/** Human-readable formatter for a command result. Return null to fall back to JSON. */
+export type HumanFormatter<T = unknown> = (result: CommandResult<T>) => string | null;
+
+const humanFormatters = new Map<string, HumanFormatter<any>>();
+
+/** Register a human-readable formatter for a command. */
+export function registerHumanFormatter<T>(command: string, formatter: HumanFormatter<T>): void {
+  humanFormatters.set(command, formatter);
+}
+
+/**
+ * Write a CommandResult to stdout and return the exit code.
+ * - TTY + no --json flag: human-readable (if formatter registered)
+ * - No TTY or --json flag: JSON
+ */
+export function outputResult<T>(result: CommandResult<T>, forceJson: boolean): number {
+  const isTTY = process.stdout.isTTY ?? false;
+  const useHuman = isTTY && !forceJson;
+
+  if (useHuman) {
+    const formatter = humanFormatters.get(result.command);
+    const human = formatter?.(result);
+    if (human !== null && human !== undefined) {
+      console.log(human);
+      return result.ok ? EXIT.OK : exitCode(result.error!.code);
+    }
+  }
+
+  // JSON output (default for non-TTY, forced with --json, or no formatter)
   console.log(JSON.stringify(result));
   return result.ok ? EXIT.OK : exitCode(result.error!.code);
 }
@@ -107,16 +134,12 @@ export function streamErr(msg: string): void {
   process.stderr.write(msg + "\n");
 }
 
-// ── CLI Error (throwable) ────────────────────────────────────────────────
+// ── Accelerator Helpers ──────────────────────────────────────────────────
 
-/** Error that carries an error code for structured reporting. */
-export class CliError extends Error {
-  constructor(
-    public readonly code: ErrorCode,
-    message: string,
-    public readonly hint?: string,
-  ) {
-    super(message);
-    this.name = "CliError";
-  }
+/** Build the --gpu/--tpu/--cpu-only flag string from stored state fields. */
+export function ensureFlag(variant: "gpu" | "tpu" | "cpu", accelerator: string, highMem?: boolean): string {
+  if (variant === "cpu") return "--cpu-only";
+  return `--${variant} ${accelerator}${highMem ? " --high-mem" : ""}`;
 }
+
+

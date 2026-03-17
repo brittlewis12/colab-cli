@@ -9,9 +9,9 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtemp, rm, mkdir, writeFile as fsWriteFile, readFile as fsReadFile, unlink } from "fs/promises";
+import { mkdtemp, rm, mkdir, writeFile as fsWriteFile, readFile as fsReadFile } from "fs/promises";
 import { join } from "path";
-import { tmpdir, homedir } from "os";
+import { tmpdir } from "os";
 import { writeJson, readJson } from "../../src/state/store.ts";
 import type { NotebookState } from "../../src/state/notebooks.ts";
 
@@ -24,17 +24,17 @@ import { runNotebookCommand } from "../../src/cli/run.ts";
 import { secretsCommand } from "../../src/cli/secrets.ts";
 import { lsCommand } from "../../src/cli/ls.ts";
 import { statusCommand } from "../../src/cli/status.ts";
+import { uploadCommand } from "../../src/cli/upload.ts";
+import { downloadCommand } from "../../src/cli/download.ts";
+import { diffCommand } from "../../src/cli/diff.ts";
+import { adoptCommand } from "../../src/cli/adopt.ts";
 
 // ── Shared Setup ─────────────────────────────────────────────────────────
-
-const CREDS_DIR = join(homedir(), ".config", "colab-cli");
-const CREDS_PATH = join(CREDS_DIR, "credentials.json");
 
 let tmpDir: string;
 let origCwd: string;
 let origFetch: typeof globalThis.fetch;
-let hadCreds: boolean;
-let savedCreds: string;
+let origCredsPath: string | undefined;
 
 function makeCreds() {
   return {
@@ -51,7 +51,8 @@ function makeState(overrides?: Partial<NotebookState>): NotebookState {
   return {
     notebookHash: "abc_def_123..........",
     endpoint: "gpu-t4-s-test123",
-    gpu: "t4",
+    accelerator: "t4",
+    variant: "gpu",
     createdAt: new Date().toISOString(),
     ...overrides,
   };
@@ -139,21 +140,15 @@ function mockFetchFor(opts: {
 }
 
 beforeEach(async () => {
-  // Temp dir with .colab/
+  // Temp dir with .colab/ and credentials in temp (never touches real ~/.config)
   tmpDir = await mkdtemp(join(tmpdir(), "colab-cmd-test-"));
   await mkdir(join(tmpDir, ".colab", "notebooks"), { recursive: true });
 
-  // Save existing creds
-  try {
-    savedCreds = await fsReadFile(CREDS_PATH, "utf-8");
-    hadCreds = true;
-  } catch {
-    hadCreds = false;
-  }
-
-  // Write mock creds
-  await mkdir(CREDS_DIR, { recursive: true });
-  await fsWriteFile(CREDS_PATH, JSON.stringify(makeCreds()));
+  // Write mock creds to temp dir and point env var at them
+  const credsPath = join(tmpDir, "credentials.json");
+  await fsWriteFile(credsPath, JSON.stringify(makeCreds()));
+  origCredsPath = process.env.COLAB_CREDENTIALS_PATH;
+  process.env.COLAB_CREDENTIALS_PATH = credsPath;
 
   // chdir to temp dir
   origCwd = process.cwd();
@@ -167,11 +162,11 @@ afterEach(async () => {
   process.chdir(origCwd);
   globalThis.fetch = origFetch;
 
-  // Restore creds
-  if (hadCreds) {
-    await fsWriteFile(CREDS_PATH, savedCreds);
+  // Restore credentials env var
+  if (origCredsPath !== undefined) {
+    process.env.COLAB_CREDENTIALS_PATH = origCredsPath;
   } else {
-    try { await unlink(CREDS_PATH); } catch {}
+    delete process.env.COLAB_CREDENTIALS_PATH;
   }
 
   await rm(tmpDir, { recursive: true, force: true });
@@ -187,7 +182,7 @@ describe("auth status", () => {
   test("email field is not corrupted by subscription tier", async () => {
     // Write creds with a real email
     await fsWriteFile(
-      CREDS_PATH,
+      process.env.COLAB_CREDENTIALS_PATH!,
       JSON.stringify({
         ...makeCreds(),
         email: "user@example.com",
@@ -215,6 +210,31 @@ describe("auth status", () => {
     // Email should be from stored creds, NOT the tier string
     expect(data.email).toBe("user@example.com");
     expect(data.tier).toBe("SUBSCRIPTION_TIER_PRO");
+  });
+
+  test("eligibleGpus and eligibleTpus populated from userInfo", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/v1/user-info")) {
+        return new Response(
+          JSON.stringify({
+            subscriptionTier: "SUBSCRIPTION_TIER_PRO",
+            eligibleAccelerators: [
+              { variant: "VARIANT_GPU", models: ["T4", "A100"] },
+              { variant: "VARIANT_TPU", models: ["V5E1", "V6E1"] },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("Error", { status: 500 });
+    }) as any;
+
+    const r = await authCommand(["status"]);
+    expect(r.ok).toBe(true);
+    const data = r.data as { eligibleGpus?: string[]; eligibleTpus?: string[] };
+    expect(data.eligibleGpus).toEqual(["T4", "A100"]);
+    expect(data.eligibleTpus).toEqual(["V5E1", "V6E1"]);
   });
 });
 
@@ -606,7 +626,7 @@ describe("ls command", () => {
 
   test("merges local state with live assignments", async () => {
     await writeState("train", makeState());
-    await writeState("eval", makeState({ endpoint: "gpu-t4-s-other", gpu: "a100" }));
+    await writeState("eval", makeState({ endpoint: "gpu-t4-s-other", accelerator: "a100" }));
 
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = input.toString();
@@ -713,6 +733,212 @@ describe("status command", () => {
     expect(data.name).toBe("train");
     expect(data.status).toBe("running");
     expect(data.dirty).toBe(true);
-    expect(data.gpu).toBe("t4");
+    expect(data.accelerator).toBe("t4");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Upload ───────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("upload command", () => {
+  test("returns NOT_FOUND when no notebook state", async () => {
+    const r = await uploadCommand(["nonexistent", "file.csv", "data.csv"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("NOT_FOUND");
+  });
+
+  test("returns NOT_FOUND when local file missing", async () => {
+    await writeState("nb", makeState());
+    globalThis.fetch = mockFetchFor({});
+
+    const r = await uploadCommand(["nb", "/tmp/nonexistent_xyz.csv", "data.csv"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("NOT_FOUND");
+    expect(r.error!.message).toContain("Local file");
+  });
+
+  test("happy path: uploads file to runtime", async () => {
+    await writeState("nb", makeState());
+    const localFile = join(tmpDir, "test-data.csv");
+    await fsWriteFile(localFile, "a,b,c\n1,2,3\n");
+
+    let uploadedPath = "";
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input.toString();
+      const method = init?.method ?? "GET";
+      if (url.includes("/v1/runtime-proxy-token")) {
+        return new Response(
+          JSON.stringify({ token: "tok", tokenTtl: "3600s", url: "https://proxy.test" }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/api/contents/") && method === "PUT") {
+        uploadedPath = new URL(url).pathname;
+        return new Response(JSON.stringify({ name: "test.csv" }), { status: 200 });
+      }
+      if (url.includes("/keep-alive/")) return new Response("", { status: 200 });
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await uploadCommand(["nb", localFile, "data.csv"]);
+    expect(r.ok).toBe(true);
+    expect(r.data!.bytes).toBeGreaterThan(0);
+    expect(r.data!.remote).toBe("data.csv");
+    // Verify content/ prefix was applied
+    expect(uploadedPath).toContain("/api/contents/content/data.csv");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Download ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("download command", () => {
+  test("returns NOT_FOUND when no notebook state", async () => {
+    const r = await downloadCommand(["nonexistent", "data.csv", "out.csv"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("NOT_FOUND");
+  });
+
+  test("happy path: downloads file from runtime", async () => {
+    await writeState("nb", makeState());
+    const localOut = join(tmpDir, "downloaded.csv");
+
+    const content = "x,y\n4,5\n";
+    const b64 = Buffer.from(content).toString("base64");
+
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input.toString();
+      if (url.includes("/v1/runtime-proxy-token")) {
+        return new Response(
+          JSON.stringify({ token: "tok", tokenTtl: "3600s", url: "https://proxy.test" }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/api/contents/content/results.csv")) {
+        return new Response(JSON.stringify({ content: b64 }), { status: 200 });
+      }
+      if (url.includes("/keep-alive/")) return new Response("", { status: 200 });
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await downloadCommand(["nb", "results.csv", localOut]);
+    expect(r.ok).toBe(true);
+    expect(r.data!.bytes).toBe(content.length);
+
+    // Verify file was written locally
+    const written = await fsReadFile(localOut, "utf-8");
+    expect(written).toBe(content);
+  });
+
+  test("returns NOT_FOUND when remote file missing", async () => {
+    await writeState("nb", makeState());
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/v1/runtime-proxy-token")) {
+        return new Response(
+          JSON.stringify({ token: "tok", tokenTtl: "3600s", url: "https://proxy.test" }),
+          { status: 200 },
+        );
+      }
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await downloadCommand(["nb", "nope.csv", join(tmpDir, "out.csv")]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("NOT_FOUND");
+    expect(r.error!.message).toContain("nope.csv");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Diff ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("diff command", () => {
+  test("returns NOT_FOUND when no notebook state", async () => {
+    const r = await diffCommand(["nonexistent"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("NOT_FOUND");
+  });
+
+  test("reports unchanged cells when local matches remote", async () => {
+    await writeState("train", makeState());
+    await fsWriteFile(join(tmpDir, "train.py"), minimalPy('print("hello")'));
+    globalThis.fetch = mockFetchFor({ remoteIpynb: minimalIpynb('print("hello")') });
+
+    const r = await diffCommand(["train"]);
+    expect(r.ok).toBe(true);
+    const data = r.data as any;
+    expect(data.unchanged).toBe(1);
+    expect(data.added).toBe(0);
+    expect(data.deleted).toBe(0);
+    expect(data.modified).toBe(0);
+  });
+
+  test("reports added cell when local has more cells", async () => {
+    await writeState("train", makeState());
+    await fsWriteFile(
+      join(tmpDir, "train.py"),
+      '# %%\nprint("hello")\n\n# %%\nprint("new cell")\n',
+    );
+    globalThis.fetch = mockFetchFor({ remoteIpynb: minimalIpynb('print("hello")') });
+
+    const r = await diffCommand(["train"]);
+    expect(r.ok).toBe(true);
+    const data = r.data as any;
+    expect(data.added).toBeGreaterThanOrEqual(1);
+    expect(data.localCells).toBe(2);
+    expect(data.remoteCells).toBe(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Adopt ────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("adopt command", () => {
+  test("returns NOT_FOUND when endpoint not in assignments", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/v1/assignments")) {
+        return new Response(JSON.stringify({ assignments: [] }), { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as any;
+
+    const r = await adoptCommand(["gpu-nonexistent", "--name", "nb"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("NOT_FOUND");
+  });
+
+  test("returns CONFLICT when name already taken", async () => {
+    await writeState("taken", makeState());
+
+    const r = await adoptCommand(["gpu-t4-s-xyz", "--name", "taken"]);
+    expect(r.ok).toBe(false);
+    expect(r.error!.code).toBe("CONFLICT");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── Drive state persistence ──────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("drive state", () => {
+  test("NotebookState persists driveEnabled and driveFileId", async () => {
+    const state = makeState({
+      driveEnabled: true,
+      driveFileId: "1abc123",
+      driveFolderId: "folder456",
+    } as any);
+    await writeState("train", state);
+
+    const loaded = await readJson<any>(join(tmpDir, ".colab", "notebooks", "train.json"));
+    expect(loaded.driveEnabled).toBe(true);
+    expect(loaded.driveFileId).toBe("1abc123");
+    expect(loaded.driveFolderId).toBe("folder456");
   });
 });

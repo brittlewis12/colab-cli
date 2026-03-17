@@ -21,4 +21,6 @@ export const FILTERED_METADATA_KEYS = new Set([
   "lines_to_next_cell",
   "lines_to_end_of_cell_marker",
   "cell_marker",
+  // colab-cli internal (added at parse time for --cell title addressing)
+  "title",
 ]);

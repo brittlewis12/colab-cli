@@ -100,7 +100,8 @@ export class KernelConnection {
       };
 
       ws.onerror = (e: Event) => {
-        reject(new Error(`WebSocket error: ${e}`));
+        const msg = e instanceof ErrorEvent ? e.message : "connection failed";
+        reject(new Error(`WebSocket error: ${msg}`));
       };
 
       ws.onmessage = (event: MessageEvent) => {
@@ -145,15 +146,17 @@ export class KernelConnection {
 
     if (!timeoutMs) return executionPromise;
 
-    return Promise.race([
-      executionPromise,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => {
-          this.pending.delete(msgId);
-          reject(new Error(`Execution timed out after ${timeoutMs}ms`));
-        }, timeoutMs),
-      ),
-    ]);
+    let timer: ReturnType<typeof setTimeout>;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.pending.delete(msgId);
+        reject(new Error(`Execution timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+
+    return Promise.race([executionPromise, timeoutPromise]).finally(() => {
+      clearTimeout(timer);
+    });
   }
 
   /** Close the connection. */
@@ -199,10 +202,12 @@ export class KernelConnection {
     }
 
     // --- Handle input_request (Python's input()) ---
-    // Reply with an error so the kernel doesn't block forever.
+    // Reply with EOFError-triggering empty + raise so the kernel doesn't block forever.
     // CLI execution is non-interactive; input() cannot be satisfied.
+    // Sending EOFError via the kernel's stdin channel causes Python to raise EOFError,
+    // which is the correct behavior for non-interactive contexts.
     if (msgType === "input_request") {
-      this.sendInputReply("", msg);
+      this.sendInputReply("\x04", msg); // Ctrl-D (EOF) triggers EOFError in Python
       return;
     }
 
@@ -448,8 +453,8 @@ export class KernelConnection {
 
   /**
    * Send an input_reply for Python's input().
-   * We send an empty string — the kernel will unblock and return "".
-   * Callers should handle the subsequent error gracefully.
+   * We send Ctrl-D (EOF, \x04) to trigger EOFError in the kernel.
+   * CLI execution is non-interactive; input() cannot be satisfied.
    */
   private sendInputReply(value: string, parentMsg: JupyterMessage): void {
     if (!this.ws) return;

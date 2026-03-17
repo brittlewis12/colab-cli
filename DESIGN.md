@@ -14,11 +14,11 @@ A TypeScript CLI that lets AI coding agents execute Python code on Google Colab 
 
 ### P1: The Notebook Is the Object
 
-Colab's actual abstraction is a notebook with a 1:1 runtime. We match that — no separate "VM" concept exposed. `colab ensure training --gpu t4` creates a notebook named "training" backed by a T4 runtime. The notebook is the unit of lifecycle, execution, and file management.
+Colab's actual abstraction is a notebook with a 1:1 runtime. We match that — no separate "VM" concept exposed. `colab ensure training --gpu t4` (or `--tpu v5e1`, or `--cpu-only`) creates a notebook named "training" backed by the requested accelerator. The notebook is the unit of lifecycle, execution, and file management.
 
 ### P2: Explicit Lifecycle, No Defaults for Expensive Things
 
-`ensure` not `open`. No default GPU type — the agent must say `--gpu t4` or `--gpu a100` explicitly. GPU allocation costs real money and real time. Making it explicit prevents agents from accidentally burning compute units.
+`ensure` not `open`. No default accelerator — the agent must explicitly choose `--gpu t4`, `--tpu v5e1`, or `--cpu-only`. GPU/TPU allocation costs real money and real time. Making it explicit prevents agents from accidentally burning compute units.
 
 ### P3: Three-Tier State Model
 
@@ -60,7 +60,7 @@ Every error includes: what happened, why, and the exact command to fix it.
   "error": {
     "code": "QUOTA_EXCEEDED",
     "message": "No compute units remaining for T4 GPU",
-    "hint": "colab ensure training --gpu none  # use CPU runtime instead"
+    "hint": "colab ensure training --cpu-only  # use CPU runtime instead"
   }
 }
 ```
@@ -112,7 +112,9 @@ colab auth logout         # Revoke tokens, delete stored credentials
 ### Notebook Lifecycle
 
 ```
-colab ensure <name> --gpu <type>   # Get-or-create notebook + runtime (blocks until ready)
+colab ensure <name> --gpu <type>   # Get-or-create with GPU (t4, a100, ...)
+colab ensure <name> --tpu <type>   # Get-or-create with TPU (v5e1, v6e1, ...)
+colab ensure <name> --cpu-only     # Get-or-create CPU-only runtime
 colab ls                           # List all notebooks/runtimes
 colab status [<name>]              # Overview (no arg) or notebook details
 colab kill <name>                  # Teardown runtime, preserve local .py
@@ -159,9 +161,9 @@ colab download <name> <remote> <local>  # Download file from runtime
 
 ## 4. Command Details
 
-### `colab ensure <name> --gpu <type>`
+### `colab ensure <name> --gpu <type> | --tpu <type> | --cpu-only`
 
-Get-or-create a notebook with a runtime. Idempotent. Blocks until the runtime is *fully ready* — not just assigned, but kernel-accessible.
+Get-or-create a notebook with a runtime. Idempotent. Blocks until the runtime is *fully ready* — not just assigned, but kernel-accessible. Exactly one of `--gpu`, `--tpu`, or `--cpu-only` required.
 
 **Readiness means**: assignment exists, proxy token is obtainable, session creation succeeds, kernel is discoverable via `/api/kernels`. If `ensure` returns 0, the next `exec`/`run`/`push`/`pull` can proceed without waiting.
 
@@ -185,13 +187,15 @@ Get-or-create a notebook with a runtime. Idempotent. Blocks until the runtime is
 | Flag | Type | Required | Description |
 |---|---|---|---|
 | `<name>` | positional | yes | Notebook name |
-| `--gpu` | enum | yes | `none`, `t4`, `l4`, `v100`, `a100` |
+| `--gpu` | string | mutually exclusive | GPU model: `t4`, `l4`, `v100`, `a100` |
+| `--tpu` | string | mutually exclusive | TPU model: `v5e1`, `v6e1`, etc. |
+| `--cpu-only` | bool | mutually exclusive | CPU-only runtime (no accelerator) |
 | `--high-mem` | bool | no | High-memory VM variant |
 | `--ttl` | duration | no, default `2h` | Auto-kill after duration. `0` = no TTL |
 | `--timeout` | seconds | no, default `120` | Max wait for assignment |
 | `--drive` | bool | no | Enable Drive persistence (requires one-time browser consent per runtime, see A9) |
 
-No default GPU. The agent must be explicit about what it needs.
+No default accelerator. The agent must be explicit about what it needs. Cross-variant validation provides helpful hints: `--tpu t4` → "t4 is a GPU model, not a TPU. Did you mean --gpu t4?"
 
 **Exit codes**: 0 = ready, 4 = auth error, 5 = quota exceeded, 6 = timeout
 
@@ -267,7 +271,7 @@ Execute ad-hoc Python on a notebook's runtime. This is the **core execution prim
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--timeout` | seconds | 300 | Max execution time |
+| `--timeout` | seconds | 300 | Client wait timeout (remote execution continues if exceeded) |
 
 ### `colab run <name>`
 
@@ -279,7 +283,7 @@ Execute cells of the notebook on its runtime. Built on top of `exec` — reads c
 3. Fetch remote `.ipynb` from `content/<name>.ipynb` via Contents API → parse cells
 4. Filter cells by `--cell` if specified, otherwise all code cells
 5. For each code cell sequentially: `execute_request` → collect outputs
-6. Stop on first error (default) — `--continue-on-error` deferred to Phase 4
+6. Stop on first error (default), or continue all cells with `--continue-on-error`
 7. Return collected results for all cells
 
 **Cell addressing** (`--cell <ref>`):
@@ -298,8 +302,10 @@ Execute cells of the notebook on its runtime. Built on top of `exec` — reads c
 |---|---|---|---|
 | `--cell` | string | (all cells) | Cell reference (index, title, or ID) |
 | `--push` | bool | false | Push local changes before running |
-| `--timeout` | seconds | 300 | Max execution time per cell |
+| `--continue-on-error` | bool | false | Execute all cells even if some fail |
+| `--timeout` | seconds | 300 | Client wait timeout per cell (remote execution continues if exceeded) |
 | `--no-drive` | bool | false | Skip Drive upload even if `driveEnabled` is enabled |
+| `--force` | bool | false | Forward to push (suppress conflict warning) |
 
 **Drive sync**: If `driveEnabled` is enabled, the updated `.ipynb` (with outputs) is synced to Drive after `run` completes — including on `ok: false` (partial outputs from failed runs are valuable for debugging). Use `--no-drive` to skip. See A9.
 
@@ -329,7 +335,7 @@ List all known notebooks and their runtime status.
 1. Read all `.colab/notebooks/<name>.json` files (local state)
 2. Call `listAssignments()` to get live runtime status
 3. Merge: match local state to remote assignments by endpoint
-4. Display: name, gpu, runtime status (running/dead/unknown), last activity
+4. Display: name, accelerator, runtime status (running/dead/unknown), last activity
 
 Notebooks with local state but dead runtimes show as "stopped." Remote assignments with no local state are listed as "unmanaged" (created in Colab web UI).
 
@@ -337,7 +343,7 @@ Notebooks with local state but dead runtimes show as "stopped." Remote assignmen
 
 **No argument**: Combined dashboard — auth state, quota, all notebooks (same as `ls` but with quota info).
 
-**With argument**: Detailed status for one notebook — runtime state, gpu, kernel status, dirty state, last push/pull timestamps, TTL remaining. Sends keep-alive as side effect.
+**With argument**: Detailed status for one notebook — runtime state, accelerator, kernel status, dirty state, last push/pull timestamps, TTL remaining. Sends keep-alive as side effect.
 
 ### `colab upload <name> <local> <remote>`
 
@@ -380,7 +386,7 @@ ensure → pull → edit → push → run → pull (to see outputs)
 ### Detailed Flow
 
 ```
-1. colab ensure training --gpu t4
+1. colab ensure training --gpu t4      # or --tpu v5e1, or --cpu-only
    → Runtime allocated, notebook created
    → .colab/notebooks/training.json written
 
@@ -943,7 +949,7 @@ interface CommandResult<T = unknown> {
 | 3 | NOT_FOUND | Notebook doesn't exist, runtime reclaimed |
 | 4 | AUTH | Not authenticated, token expired |
 | 5 | QUOTA | No compute units for requested resource |
-| 6 | TIMEOUT | Assignment or execution timed out |
+| 6 | TIMEOUT | Client wait timeout exceeded (remote execution may still be running) |
 | 7 | EXEC_ERROR | Python code raised an exception |
 
 Exit code 7 is intentional: agents use exit codes to distinguish "the CLI broke" (1) from "my Python code has a bug" (7).
@@ -975,7 +981,7 @@ notebooks/
 {
   "notebookHash": "380b033e_4abf_4918_9f96_3d147452ff9a........",
   "endpoint": "gpu-t4-s-bcdhjyw4onbe",
-  "gpu": "t4",
+  "accelerator": "t4",
   "createdAt": "2026-03-10T12:00:00Z",
   "lastKeepAlive": "2026-03-10T12:30:00Z",
   "pushedHash": "sha256:abc123...",
@@ -995,7 +1001,7 @@ notebooks/
 **What IS persisted:**
 - `notebookHash` — opaque identifier passed to `assign()`. Regenerated on each `ensure` (including reclamation recovery). Persisted so `listAssignments()` can match the current assignment.
 - `endpoint` — needed to find the runtime via `listAssignments()` and `refreshProxyToken()`.
-- `gpu` — needed to verify specs match on `ensure` re-entry.
+- `accelerator` — needed to verify specs match on `ensure` re-entry.
 - `createdAt`, `lastKeepAlive` — operational metadata.
 - `pushedHash` — SHA-256 of the last-pushed .py, for dirty state tracking.
 - `driveEnabled` — whether `--drive` was requested. Survives reclamation so re-ensure knows to re-trigger Drive consent. Only present when `--drive` is used.
@@ -1103,7 +1109,10 @@ colab-cli/
 │   │   ├── secrets.ts           # secrets list command
 │   │   ├── restart.ts           # restart command
 │   │   ├── interrupt.ts         # interrupt command
-│   │   └── output.ts            # JSON/human-readable formatting
+│   │   ├── upload.ts            # upload command
+│   │   ├── download.ts          # download command
+│   │   ├── adopt.ts             # adopt command
+│   │   └── output.ts            # JSON envelope, error codes, ensureFlag
 │   ├── notebook/                # Percent-format conversion
 │   │   ├── parse.ts             # .py percent → cell list
 │   │   ├── serialize.ts         # notebook → .py percent
@@ -1112,44 +1121,40 @@ colab-cli/
 │   │   ├── magic.ts             # Magic command comment/uncomment
 │   │   ├── header.ts            # YAML front-matter
 │   │   ├── types.ts             # Notebook/cell type definitions
+│   │   ├── constants.ts         # Filtered metadata keys
 │   │   └── ipynb.ts             # .ipynb JSON parse/serialize
 │   ├── colab/                   # Colab API client
 │   │   ├── client.ts            # HTTP client for Colab APIs
 │   │   ├── headers.ts           # Custom header construction
-│   │   ├── types.ts             # Zod schemas for API responses
-│   │   └── xssi.ts              # XSSI prefix stripping
+│   │   ├── types.ts             # API response types
+│   │   ├── xssi.ts              # XSSI prefix stripping
+│   │   ├── drive.ts             # Drive auto-sync via runtime execution
+│   │   └── secrets.ts           # Secret resolution for GetSecret
 │   ├── jupyter/                 # Jupyter kernel communication
 │   │   ├── connection.ts        # KernelConnection (WebSocket)
 │   │   ├── messages.ts          # Jupyter message types
 │   │   ├── contents.ts          # Contents API client
-│   │   └── api.ts               # Jupyter REST API (sessions, kernels)
+│   │   ├── sessions.ts          # Sessions + Kernels REST API
+│   │   └── lifecycle.ts         # Kernel get-or-create with retry
 │   ├── auth/                    # OAuth2 implementation
-│   │   ├── oauth.ts             # OAuth2 flow (PKCE, loopback)
-│   │   ├── tokens.ts            # Token storage and refresh
-│   │   └── scopes.ts            # Required scopes
-│   ├── state/                   # Local state management
-│   │   ├── store.ts             # State file read/write with locking
-│   │   ├── notebooks.ts         # Per-notebook state
-│   │   └── config.ts            # User/project config
-│   └── util/
-│       ├── errors.ts            # Error types with codes and hints
-│       ├── hash.ts              # Content hashing (SHA-256)
-│       ├── ids.ts               # ID generation (notebookHash, names)
-│       └── time.ts              # Duration parsing, TTL
+│   │   ├── oauth.ts             # OAuth2 loopback flow (with CSRF state)
+│   │   └── tokens.ts            # Token storage and refresh
+│   └── state/                   # Local state management
+│       ├── store.ts             # Atomic JSON state read/write
+│       └── notebooks.ts         # Per-notebook state + project root discovery
 ├── test/
 │   ├── fixtures/
-│   │   ├── golden/              # Known-good .ipynb/.py pairs
-│   │   └── corpus/              # Real-world notebooks (gitignored)
+│   │   └── golden/              # Known-good .ipynb/.py pairs
 │   ├── unit/                    # Unit tests per module
-│   ├── snapshot/                # Snapshot/golden-file tests
 │   ├── differential/            # Oracle tests (vs uvx jupytext)
 │   ├── property/                # fast-check property tests
-│   └── corpus/                  # Corpus regression tests
+│   └── e2e/                     # Live validation script
 ├── DESIGN.md
 ├── SKILL.md
+├── README.md
+├── LICENSE
 ├── package.json
-├── tsconfig.json
-└── bunfig.toml
+└── tsconfig.json
 ```
 
 ---
@@ -1272,53 +1277,53 @@ Wire the pieces together into real commands. Build order revised per A8 live val
 - [ ] Resolve Q9 if possible (does assign accept TTL params?) — if not, defer `--ttl` to Phase 4
 
 **Step 2: Output + state scaffolding**
-- [ ] `src/cli/output.ts` — JSON envelope (`CommandResult<T>`), error types with codes + hints, exit code mapping, human-readable formatting. Every command depends on this.
-- [ ] `src/state/store.ts` — State file read/write with atomic rename (write .tmp → rename). No flock.
-- [ ] `src/state/notebooks.ts` — Per-notebook state (project root discovery, .colab/ management, notebook path convention: `content/<name>.ipynb`)
-- [ ] `src/cli/index.ts` — Entry point, command router
+- [x] `src/cli/output.ts` — JSON envelope (`CommandResult<T>`), error types with codes + hints, exit code mapping, human-readable formatting. Every command depends on this.
+- [x] `src/state/store.ts` — State file read/write with atomic rename (write .tmp → rename). No flock.
+- [x] `src/state/notebooks.ts` — Per-notebook state (project root discovery, .colab/ management, notebook path convention: `content/<name>.ipynb`)
+- [x] `src/cli/index.ts` — Entry point, command router
 
 **Step 3: Auth command (simplest, validates output pipeline)**
-- [ ] `src/cli/auth.ts` — `colab auth login/status/logout`
+- [x] `src/cli/auth.ts` — `colab auth login/status/logout`
 
 **Step 4: ensure (the critical path)**
-- [ ] `src/cli/ensure.ts` — `colab ensure` (assign + session retry + kernel readiness check + empty .ipynb creation at `content/<name>.ipynb`)
-- [ ] `src/jupyter/lifecycle.ts` — `getOrCreateKernel(proxyUrl, proxyToken)`: list sessions, create if needed (with 180s retry), return kernel ID. Shared by ensure, exec, run, restart, interrupt.
+- [x] `src/cli/ensure.ts` — `colab ensure` (assign + session retry + kernel readiness check + empty .ipynb creation at `content/<name>.ipynb`)
+- [x] `src/jupyter/lifecycle.ts` — `getOrCreateKernel(proxyUrl, proxyToken)`: list sessions, create if needed (with 180s retry), return kernel ID. Shared by ensure, exec, run, restart, interrupt.
 
 **Step 5: exec (core execution primitive)**
-- [ ] `src/cli/exec.ts` — `colab exec` (connect → execute → disconnect, proxy token refresh, keep-alive side effect)
-- [ ] Fix `KernelConnection` completion: use `gotReply && gotIdle` dual-signal (see Section 10, Completion)
-- [ ] Set `allow_stdin: true` in `makeExecuteRequest` (required for `colab_request` handling — see Section 10, `allow_stdin` interaction)
+- [x] `src/cli/exec.ts` — `colab exec` (connect → execute → disconnect, proxy token refresh, keep-alive side effect)
+- [x] Fix `KernelConnection` completion: use `gotReply && gotIdle` dual-signal (see Section 10, Completion)
+- [x] Set `allow_stdin: true` in `makeExecuteRequest` (required for `colab_request` handling — see Section 10, `allow_stdin` interaction)
 
 **Step 6: pull/push (file transfer with correct paths)**
-- [ ] `src/cli/pull.ts` — `colab pull` (Contents API `content/<name>.ipynb` → ipynbToPercent → write .py, dirty check)
-- [ ] `src/cli/push.ts` — `colab push` (percentToCells → merge → Contents API `content/<name>.ipynb`, no timestamp conflict detection — merge handles it)
-- [ ] `src/cli/kill.ts` — `colab kill` (unassign + clean up state)
+- [x] `src/cli/pull.ts` — `colab pull` (Contents API `content/<name>.ipynb` → ipynbToPercent → write .py, dirty check)
+- [x] `src/cli/push.ts` — `colab push` (percentToCells → merge → Contents API `content/<name>.ipynb`, no timestamp conflict detection — merge handles it)
+- [x] `src/cli/kill.ts` — `colab kill` (unassign + clean up state)
 
 **Step 7: run (cell selection + sequential exec)**
-- [ ] `src/cli/run.ts` — `colab run` (fetch remote .ipynb, parse cells, sequential execute_request per cell, --push, --cell, stop-on-error)
+- [x] `src/cli/run.ts` — `colab run` (fetch remote .ipynb, parse cells, sequential execute_request per cell, --push, --cell, stop-on-error)
 
 **Step 8: Dogfood**
-- [ ] Dogfood: ensure → pull → edit → push → run → exec cycle works end-to-end
-- [ ] Dogfood: reclamation recovery (kill, re-ensure, push from cache)
+- [x] Dogfood: ensure → pull → edit → push → run → exec cycle works end-to-end
+- [x] Dogfood: reclamation recovery (kill, re-ensure, push from cache)
 
 ### Phase 4: Supporting Commands + Polish
 
-- [ ] `src/cli/secrets.ts` — `colab secrets list` (calls `/userdata/list`, returns key names only — see A10)
-- [ ] `GetSecret` handler in `KernelConnection` (env var > Colab API > not found — see A10)
-- [ ] `ensure --drive` — Drive credential propagation + consent polling (see A9)
-- [ ] Drive auto-sync in `push`/`run` — upload `.ipynb` to Drive via runtime exec (see A9)
-- [ ] `src/cli/ls.ts` — `colab ls`
-- [ ] `src/cli/status.ts` — `colab status` (include `driveEnabled`/`driveFileId` in output)
-- [ ] `src/cli/diff.ts` — `colab diff`
-- [ ] `src/cli/restart.ts` — `colab restart`
-- [ ] `src/cli/interrupt.ts` — `colab interrupt`
-- [ ] `colab upload` / `colab download` (with `content/` path prefix)
-- [ ] `colab adopt` — bind a name to an existing endpoint from `listAssignments()` (recovery from `.colab/` deletion)
-- [ ] Advisory conflict detection for push (content hash comparison, not timestamps)
-- [ ] `--continue-on-error` flag for `run`
+- [x] `src/cli/secrets.ts` — `colab secrets list` (calls `/userdata/list`, returns key names only — see A10)
+- [x] `GetSecret` handler in `KernelConnection` (env var > Colab API > not found — see A10)
+- [x] `ensure --drive` — Drive credential propagation + consent polling (see A9)
+- [x] Drive auto-sync in `push`/`run` — upload `.ipynb` to Drive via runtime exec (see A9)
+- [x] `src/cli/ls.ts` — `colab ls`
+- [x] `src/cli/status.ts` — `colab status` (include `driveEnabled`/`driveFileId` in output)
+- [x] `src/cli/diff.ts` — `colab diff`
+- [x] `src/cli/restart.ts` — `colab restart`
+- [x] `src/cli/interrupt.ts` — `colab interrupt`
+- [x] `colab upload` / `colab download` (with `content/` path prefix)
+- [x] `colab adopt` — bind a name to an existing endpoint from `listAssignments()` (recovery from `.colab/` deletion)
+- [x] Advisory conflict detection for push (content hash comparison, not timestamps)
+- [x] `--continue-on-error` flag for `run`
 - [ ] `--ttl` enforcement (pending Q9 resolution)
 - [ ] File locking (`flock`) if multi-agent concurrency becomes a real problem
-- [ ] SKILL.md (agent-facing guide, written against real CLI)
+- [x] SKILL.md (agent-facing guide, written against real CLI)
 - [ ] Corpus regression tests (nightly)
 - [ ] `run` data shape finalized and documented
 - [ ] Resolve remaining open questions from dogfooding
@@ -1406,7 +1411,7 @@ Adding `drive` scope to our OAuth flow would allow direct Drive uploads from the
 **Enabling Drive persistence:**
 
 ```
-colab ensure train --gpu t4 --drive
+colab ensure train --gpu t4 --drive    # or --tpu, --cpu-only
 ```
 
 1. Allocate runtime normally.

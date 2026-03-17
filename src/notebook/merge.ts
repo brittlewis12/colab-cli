@@ -133,12 +133,12 @@ function buildNewCell(local: Cell): Cell {
 
 // --- Four-pass matching ---
 
-interface MatchResult {
+export interface MatchResult {
   /** For each local cell index, the matched remote cell index (or -1). */
   localToRemote: number[];
 }
 
-function matchCells(localCells: Cell[], remoteCells: Cell[]): MatchResult {
+export function matchCells(localCells: Cell[], remoteCells: Cell[]): MatchResult {
   const localToRemote = new Array<number>(localCells.length).fill(-1);
   const remoteMatched = new Set<number>();
 

@@ -4,8 +4,8 @@ import { SessionsClient } from "../../src/jupyter/sessions.ts";
 function mockFetch(
   handler: (req: Request) => Response | Promise<Response>,
 ): typeof globalThis.fetch {
-  return ((input: RequestInfo | URL, init?: RequestInit) => {
-    return Promise.resolve(handler(new Request(input, init)));
+  return ((input: string | URL | Request, init?: RequestInit) => {
+    return Promise.resolve(handler(new Request(input instanceof Request ? input.url : input.toString(), init)));
   }) as typeof globalThis.fetch;
 }
 

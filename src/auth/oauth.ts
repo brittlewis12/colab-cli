@@ -48,8 +48,8 @@ export interface LoginOptions {
 
 // ── Auth URL ─────────────────────────────────────────────────────────────
 
-/** Build the Google OAuth consent URL. */
-export function buildAuthUrl(redirectUri: string): string {
+/** Build the Google OAuth consent URL with CSRF-protection state parameter. */
+export function buildAuthUrl(redirectUri: string, state: string): string {
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     redirect_uri: redirectUri,
@@ -57,6 +57,7 @@ export function buildAuthUrl(redirectUri: string): string {
     scope: SCOPES.join(" "),
     access_type: "offline",
     prompt: "consent",
+    state,
   });
   return `${AUTH_ENDPOINT}?${params.toString()}`;
 }
@@ -138,6 +139,9 @@ export async function login(opts: LoginOptions = {}): Promise<TokenResponse> {
     onAuthUrl,
   } = opts;
 
+  // Generate a random state nonce for CSRF protection
+  const oauthState = crypto.randomUUID();
+
   return new Promise<TokenResponse>((resolve, reject) => {
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -156,6 +160,19 @@ export async function login(opts: LoginOptions = {}): Promise<TokenResponse> {
 
         const code = url.searchParams.get("code");
         const error = url.searchParams.get("error");
+        const returnedState = url.searchParams.get("state");
+
+        // Validate state parameter to prevent CSRF
+        if (code && returnedState !== oauthState) {
+          settled = true;
+          clearTimeout(timer);
+          server.stop();
+          reject(new OAuthError("OAuth state mismatch — possible CSRF attack. Please retry login."));
+          return new Response(
+            "<html><body><h1>Invalid state parameter</h1><p>Possible CSRF attack. Please try again.</p></body></html>",
+            { status: 403, headers: { "Content-Type": "text/html" } },
+          );
+        }
 
         if (error) {
           settled = true;
@@ -202,7 +219,7 @@ export async function login(opts: LoginOptions = {}): Promise<TokenResponse> {
 
     // Build and emit auth URL
     const redirectUri = `http://127.0.0.1:${server.port}`;
-    const authUrl = buildAuthUrl(redirectUri);
+    const authUrl = buildAuthUrl(redirectUri, oauthState);
 
     if (onAuthUrl) {
       onAuthUrl(authUrl);

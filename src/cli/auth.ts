@@ -2,7 +2,7 @@
  * CLI: colab auth login|status|logout
  */
 
-import { ok, err, CliError, type CommandResult } from "./output.ts";
+import { ok, err, type CommandResult } from "./output.ts";
 import { login, type TokenResponse } from "../auth/oauth.ts";
 import {
   saveCredentials,
@@ -94,8 +94,11 @@ interface StatusData {
   email?: string;
   tier?: string;
   computeUnits?: number;
+  /** Current compute unit burn rate across all active runtimes (units/hour). 0 when no runtimes active. */
+  consumptionRateHourly?: number;
   tokenExpired: boolean;
   eligibleGpus?: string[];
+  eligibleTpus?: string[];
 }
 
 async function authStatus(): Promise<CommandResult<StatusData>> {
@@ -121,8 +124,12 @@ async function authStatus(): Promise<CommandResult<StatusData>> {
     const userInfo = await client.getUserInfo(token);
     data.tier = userInfo.subscriptionTier;
     data.computeUnits = userInfo.paidComputeUnitsBalance;
+    data.consumptionRateHourly = userInfo.consumptionRateHourly;
     data.eligibleGpus = userInfo.eligibleAccelerators
       ?.find((a) => a.variant === "VARIANT_GPU")
+      ?.models;
+    data.eligibleTpus = userInfo.eligibleAccelerators
+      ?.find((a) => a.variant === "VARIANT_TPU")
       ?.models;
   } catch {
     // Non-fatal — return what we have from stored creds
@@ -136,13 +143,16 @@ async function authStatus(): Promise<CommandResult<StatusData>> {
 async function authLogout(): Promise<CommandResult> {
   const creds = await loadCredentials();
 
-  if (creds?.access_token) {
-    // Revoke token (best-effort)
+  if (creds?.refresh_token) {
+    // Revoke refresh token (best-effort). The refresh token is the long-lived
+    // credential; revoking it also invalidates derived access tokens.
+    // Token sent in POST body, not query string, to avoid proxy/log exposure.
     try {
-      await fetch(
-        `https://oauth2.googleapis.com/revoke?token=${creds.access_token}`,
-        { method: "POST" },
-      );
+      await fetch("https://oauth2.googleapis.com/revoke", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `token=${creds.refresh_token}`,
+      });
     } catch {
       // Non-fatal
     }

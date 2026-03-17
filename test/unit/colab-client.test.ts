@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { ColabClient, ColabApiError } from "../../src/colab/client.ts";
-import { Variant, Outcome } from "../../src/colab/types.ts";
+import { Variant, Outcome, notebookHash } from "../../src/colab/types.ts";
 
 // --- Mock fetch helper ---
 
@@ -14,8 +14,8 @@ function mockFetch(
   const calls: Request[] = [];
   let idx = 0;
 
-  const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-    const req = new Request(input, init);
+  const fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    const req = new Request(input instanceof Request ? input.url : input.toString(), init);
     calls.push(req);
     const resp = responses[idx++];
     if (!resp) throw new Error(`No mock response for call ${idx}`);
@@ -271,7 +271,7 @@ describe("ColabClient", () => {
     expect(url.searchParams.get("port")).toBe("8080");
   });
 
-  test("propagateCredentials does GET+POST with XSRF", async () => {
+  test("propagateCredentials does GET+POST with XSRF (non-dry-run)", async () => {
     const { fetch, calls } = mockFetch([
       { body: { token: "xsrf-prop" }, xssi: true },
       { body: { success: true }, xssi: true },
@@ -301,6 +301,57 @@ describe("ColabClient", () => {
     // POST with XSRF
     expect(calls[1]!.method).toBe("POST");
     expect(calls[1]!.headers.get("X-Goog-Colab-Token")).toBe("xsrf-prop");
+  });
+
+  test("propagateCredentials dry-run only does GET, no POST (bug 3 fix)", async () => {
+    const { fetch, calls } = mockFetch([
+      {
+        body: {
+          token: "xsrf-prop",
+          success: false,
+          unauthorized_redirect_uri: "https://accounts.google.com/consent",
+        },
+        xssi: true,
+      },
+    ]);
+    const client = new ColabClient({
+      colabDomain: "https://colab.test",
+      fetch,
+    });
+
+    const result = await client.propagateCredentials(
+      "tok",
+      "ep-123",
+      "dfs_ephemeral",
+      true,
+    );
+
+    // Should return the GET response directly
+    expect(result.unauthorized_redirect_uri).toBe("https://accounts.google.com/consent");
+    expect(result.success).toBe(false);
+
+    // Only 1 call — GET only, no POST
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("GET");
+    const getUrl = new URL(calls[0]!.url);
+    expect(getUrl.searchParams.get("dryrun")).toBe("true");
+  });
+
+  test("propagateCredentials dry-run returns success:true when already consented", async () => {
+    const { fetch, calls } = mockFetch([
+      { body: { token: "xsrf", success: true }, xssi: true },
+    ]);
+    const client = new ColabClient({
+      colabDomain: "https://colab.test",
+      fetch,
+    });
+
+    const result = await client.propagateCredentials(
+      "tok", "ep-123", "dfs_ephemeral", true,
+    );
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(1);
   });
 
   test("API error throws ColabApiError", async () => {
@@ -347,6 +398,27 @@ describe("listSecrets", () => {
     expect(secrets[1]!.key).toBe("WANDB");
   });
 
+  test("handles XSSI prefix in response (bug 9 fix)", async () => {
+    const { fetch } = mockFetch([
+      {
+        body: [
+          { key: "SECRET_A", payload: "val_a", access: true },
+        ],
+        xssi: true,
+      },
+    ]);
+
+    const client = new ColabClient({
+      colabDomain: "https://colab.test",
+      fetch,
+    });
+
+    const secrets = await client.listSecrets("tok-123");
+    expect(secrets).toHaveLength(1);
+    expect(secrets[0]!.key).toBe("SECRET_A");
+    expect(secrets[0]!.payload).toBe("val_a");
+  });
+
   test("throws on auth failure", async () => {
     const { fetch } = mockFetch([{ status: 401, body: "Unauthorized" }]);
 
@@ -355,7 +427,7 @@ describe("listSecrets", () => {
       fetch,
     });
 
-    expect(client.listSecrets("bad-tok")).rejects.toThrow(ColabApiError);
+    await expect(client.listSecrets("bad-tok")).rejects.toThrow(ColabApiError);
   });
 });
 
@@ -398,5 +470,63 @@ describe("createSecretResolver", () => {
 
     // Only one API call despite three lookups
     expect(fetchCount).toBe(1);
+  });
+
+  test("concurrent calls share one fetch — no double-fetch race (bug 11 fix)", async () => {
+    let fetchCount = 0;
+    let resolveGate: (() => void) | null = null;
+
+    // Create a fetch that blocks until we release a gate
+    const slowFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      fetchCount++;
+      // Wait for gate to be released — simulates slow network
+      await new Promise<void>((r) => { resolveGate = r; });
+      const body = JSON.stringify([
+        { key: "X", payload: "val_x", access: true },
+        { key: "Y", payload: "val_y", access: true },
+      ]);
+      return new Response(body, { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    const client = new ColabClient({
+      colabDomain: "https://colab.test",
+      fetch: slowFetch,
+    });
+
+    const resolve = createSecretResolver(client, "tok");
+
+    // Launch two concurrent lookups before the first can complete
+    const p1 = resolve("X");
+    const p2 = resolve("Y");
+
+    // Release the gate — both should resolve from the same API call
+    resolveGate!();
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1).toEqual({ exists: true, payload: "val_x" });
+    expect(r2).toEqual({ exists: true, payload: "val_y" });
+
+    // Only ONE fetch call despite two concurrent resolves
+    expect(fetchCount).toBe(1);
+  });
+});
+
+// ── notebookHash ─────────────────────────────────────────────────────────
+
+describe("notebookHash", () => {
+  test("produces 44-char string with underscores and dot padding", () => {
+    const hash = notebookHash();
+    expect(hash).toHaveLength(44);
+    // UUID dashes replaced with underscores
+    expect(hash).not.toContain("-");
+    expect(hash).toContain("_");
+    // Padded with dots
+    expect(hash).toMatch(/\.+$/);
+  });
+
+  test("produces unique values", () => {
+    const a = notebookHash();
+    const b = notebookHash();
+    expect(a).not.toBe(b);
   });
 });

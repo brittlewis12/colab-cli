@@ -54,9 +54,10 @@ function normalizeOutputText(
 
 /** Split text back to array for serialization. */
 function splitOutputText(
-  text: string | undefined,
+  text: string | string[] | undefined,
 ): string[] | undefined {
   if (text === undefined) return undefined;
+  if (Array.isArray(text)) return text; // already split
   return splitSource(text);
 }
 
@@ -151,7 +152,12 @@ function parseCell(raw: RawCell_JSON): Cell {
 
 /** Parse .ipynb JSON string into a Notebook. */
 export function parseIpynb(json: string): Notebook {
-  const raw: RawNotebook_JSON = JSON.parse(json);
+  let raw: RawNotebook_JSON;
+  try {
+    raw = JSON.parse(json);
+  } catch (e) {
+    throw new Error(`Failed to parse .ipynb: ${e instanceof Error ? e.message : e}`);
+  }
   return {
     nbformat: raw.nbformat,
     nbformat_minor: raw.nbformat_minor,

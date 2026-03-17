@@ -262,19 +262,26 @@ export class ColabClient {
       record: "false",
     };
 
-    // Step 1: GET for XSRF token
-    const data = await this.colabGet<{ token?: string; xsrfToken?: string }>(
+    // Step 1: GET for XSRF token (and state check)
+    const data = await this.colabGet<Record<string, unknown> & { token?: string; xsrfToken?: string }>(
       `/credentials-propagation/${endpoint}`,
       token,
       params,
     );
+
+    // Dry-run: return the GET response without POSTing.
+    // The response tells the caller whether consent is needed
+    // (unauthorized_redirect_uri) or already granted (success: true).
+    if (dryRun) {
+      return data;
+    }
 
     const xsrf = data.token ?? data.xsrfToken;
     if (!xsrf) {
       throw new ColabApiError(0, "No XSRF token in propagation response", `/credentials-propagation/${endpoint}`);
     }
 
-    // Step 2: POST with XSRF token
+    // Step 2: POST with XSRF token (real propagation only)
     return this.colabPost<Record<string, unknown>>(
       `/credentials-propagation/${endpoint}`,
       token,
@@ -306,8 +313,8 @@ export class ColabClient {
     if (!res.ok) {
       throw new ColabApiError(res.status, await res.text(), "/userdata/list");
     }
-    // Response is standard JSON (no XSSI prefix)
-    return (await res.json()) as Array<{ key: string; payload: string; access: boolean }>;
+    // Defensively handle XSSI prefix — endpoint is on colab domain
+    return parseXssiJson<Array<{ key: string; payload: string; access: boolean }>>(await res.text());
   }
 
   // --- Keep-Alive ---
@@ -342,13 +349,28 @@ export class ColabClient {
 
 // --- Error ---
 
+/** Strip HTML tags and collapse whitespace for error messages. */
+function summarizeBody(body: string, maxLen = 200): string {
+  // If it looks like HTML, extract text content
+  if (body.includes("<") && body.includes(">")) {
+    const text = body
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return text.slice(0, maxLen) || `(HTML response, ${body.length} bytes)`;
+  }
+  return body.slice(0, maxLen);
+}
+
 export class ColabApiError extends Error {
   constructor(
     public readonly status: number,
     public readonly body: string,
     public readonly path: string,
   ) {
-    super(`Colab API error ${status} on ${path}: ${body.slice(0, 200)}`);
+    super(`Colab API error ${status} on ${path}: ${summarizeBody(body)}`);
     this.name = "ColabApiError";
   }
 }

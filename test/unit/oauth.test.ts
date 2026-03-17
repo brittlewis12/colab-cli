@@ -15,7 +15,7 @@ import {
 
 describe("buildAuthUrl", () => {
   test("includes required OAuth params", () => {
-    const url = buildAuthUrl("http://127.0.0.1:8085");
+    const url = buildAuthUrl("http://127.0.0.1:8085", "test-state");
     const parsed = new URL(url);
 
     expect(parsed.origin).toBe("https://accounts.google.com");
@@ -25,10 +25,11 @@ describe("buildAuthUrl", () => {
     expect(parsed.searchParams.get("response_type")).toBe("code");
     expect(parsed.searchParams.get("access_type")).toBe("offline");
     expect(parsed.searchParams.get("prompt")).toBe("consent");
+    expect(parsed.searchParams.get("state")).toBe("test-state");
   });
 
   test("includes all required scopes", () => {
-    const url = buildAuthUrl("http://127.0.0.1:9999");
+    const url = buildAuthUrl("http://127.0.0.1:9999", "test-state");
     const parsed = new URL(url);
     const scope = parsed.searchParams.get("scope")!;
 
@@ -160,16 +161,19 @@ describe("login", () => {
     });
 
     // Wait a tick for the server to start
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 10));
 
-    // Extract port from auth URL
+    // Extract port and state from auth URL
     expect(authUrl).toBeDefined();
-    const redirectUri = new URL(authUrl!).searchParams.get("redirect_uri")!;
+    const authParams = new URL(authUrl!).searchParams;
+    const redirectUri = authParams.get("redirect_uri")!;
+    const state = authParams.get("state")!;
     const port = new URL(redirectUri).port;
+    expect(state).toBeTruthy(); // CSRF state parameter must be present
 
-    // Simulate Google's redirect by hitting the loopback server
+    // Simulate Google's redirect by hitting the loopback server (including state)
     const redirectResponse = await fetch(
-      `http://127.0.0.1:${port}/?code=test-auth-code`,
+      `http://127.0.0.1:${port}/?code=test-auth-code&state=${state}`,
     );
     expect(redirectResponse.status).toBe(200);
     const html = await redirectResponse.text();
@@ -195,7 +199,7 @@ describe("login", () => {
     // Prevent unhandled rejection before we get to the assertion
     loginPromise.catch(() => {});
 
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 10));
 
     const redirectUri = new URL(authUrl!).searchParams.get("redirect_uri")!;
     const port = new URL(redirectUri).port;
@@ -218,7 +222,7 @@ describe("login", () => {
   test("rejects on timeout", async () => {
     const loginPromise = login({
       port: 0,
-      timeout: 200, // very short timeout
+      timeout: 50, // very short timeout
       onAuthUrl: () => {}, // suppress console output
     });
 

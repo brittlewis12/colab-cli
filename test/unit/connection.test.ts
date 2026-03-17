@@ -250,7 +250,7 @@ describe("KernelConnection", () => {
     // Close the WebSocket before reply arrives
     ws.close();
 
-    expect(resultPromise).rejects.toThrow("WebSocket closed");
+    await expect(resultPromise).rejects.toThrow("WebSocket closed");
   });
 
   test("input_request gets auto-replied so kernel unblocks", async () => {
@@ -280,7 +280,7 @@ describe("KernelConnection", () => {
     expect(ws.sent).toHaveLength(2);
     const reply = JSON.parse(ws.sent[1]!);
     expect(reply.header.msg_type).toBe("input_reply");
-    expect(reply.content.value).toBe("");
+    expect(reply.content.value).toBe("\x04"); // EOF triggers EOFError in Python
     expect(reply.channel).toBe("stdin");
 
     // Complete the execution normally
@@ -318,8 +318,51 @@ describe("KernelConnection", () => {
     // Execute with a very short timeout — never send reply
     const promise = conn.execute("time.sleep(999)", 50);
 
-    expect(promise).rejects.toThrow("timed out");
+    await expect(promise).rejects.toThrow("timed out");
 
+    conn.close();
+  });
+
+  test("timeout timer is cleared after successful execution (bug 6 fix)", async () => {
+    resetMocks();
+    const conn = new KernelConnection(
+      "https://proxy.test",
+      "k-1",
+      "ptok",
+      { WebSocket: MockWebSocket as any },
+    );
+    await conn.connect();
+    const ws = MockWebSocket.instances[0]!;
+
+    // Execute with a long timeout
+    const resultPromise = conn.execute('print("ok")', 5000);
+    const msgId = JSON.parse(ws.sent[0]!).header.msg_id;
+
+    // Complete immediately
+    ws.receive({
+      header: { msg_type: "execute_reply" },
+      parent_header: { msg_id: msgId },
+      content: { status: "ok", execution_count: 1 },
+      metadata: {},
+      channel: "shell",
+    });
+    ws.receive({
+      header: { msg_type: "status" },
+      parent_header: { msg_id: msgId },
+      content: { execution_state: "idle" },
+      metadata: {},
+      channel: "iopub",
+    });
+
+    const result = await resultPromise;
+    expect(result.status).toBe("ok");
+
+    // Wait longer than the timeout would have been — if timer wasn't
+    // cleared, this would cause issues (stale timer fire, pending.delete
+    // on already-resolved msgId, etc.)
+    await new Promise((r) => setTimeout(r, 50));
+
+    // No error thrown — timer was properly cleared
     conn.close();
   });
 

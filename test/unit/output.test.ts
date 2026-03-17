@@ -3,8 +3,7 @@ import {
   ok,
   err,
   exitCode,
-  outputJson,
-  CliError,
+  ensureFlag,
   EXIT,
   type CommandResult,
 } from "../../src/cli/output.ts";
@@ -64,13 +63,29 @@ describe("exitCode", () => {
   });
 });
 
-describe("CliError", () => {
-  test("carries code and hint", () => {
-    const e = new CliError("AUTH", "expired", "run login");
-    expect(e.code).toBe("AUTH");
-    expect(e.message).toBe("expired");
-    expect(e.hint).toBe("run login");
-    expect(e.name).toBe("CliError");
-    expect(e).toBeInstanceOf(Error);
+describe("ensureFlag", () => {
+  test("GPU variant produces --gpu flag", () => {
+    expect(ensureFlag("gpu", "t4")).toBe("--gpu t4");
+    expect(ensureFlag("gpu", "a100")).toBe("--gpu a100");
+    expect(ensureFlag("gpu", "v100")).toBe("--gpu v100");
+  });
+
+  test("TPU variant produces --tpu flag", () => {
+    expect(ensureFlag("tpu", "v5e1")).toBe("--tpu v5e1");
+    expect(ensureFlag("tpu", "v6e1")).toBe("--tpu v6e1");
+  });
+
+  test("CPU variant produces --cpu-only flag", () => {
+    expect(ensureFlag("cpu", "cpu")).toBe("--cpu-only");
+    expect(ensureFlag("cpu", "")).toBe("--cpu-only");
+  });
+
+  test("highMem appends --high-mem flag", () => {
+    expect(ensureFlag("gpu", "t4", true)).toBe("--gpu t4 --high-mem");
+    expect(ensureFlag("tpu", "v5e1", true)).toBe("--tpu v5e1 --high-mem");
+    expect(ensureFlag("gpu", "a100", false)).toBe("--gpu a100");
+    expect(ensureFlag("cpu", "cpu", true)).toBe("--cpu-only");
   });
 });
+
+

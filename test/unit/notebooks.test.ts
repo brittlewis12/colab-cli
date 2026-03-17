@@ -14,6 +14,7 @@ import {
   listNotebookNames,
   hashFile,
   isDirty,
+  isValidNotebookName,
   type NotebookState,
 } from "../../src/state/notebooks.ts";
 
@@ -31,11 +32,61 @@ function makeState(overrides?: Partial<NotebookState>): NotebookState {
   return {
     notebookHash: "abc_def_123..........",
     endpoint: "gpu-t4-s-test",
-    gpu: "t4",
+    accelerator: "t4",
+    variant: "gpu",
     createdAt: new Date().toISOString(),
     ...overrides,
   };
 }
+
+// ── Name validation ──────────────────────────────────────────────────────
+
+describe("isValidNotebookName", () => {
+  test("accepts simple alphanumeric names", () => {
+    expect(isValidNotebookName("train")).toBe(true);
+    expect(isValidNotebookName("myNotebook")).toBe(true);
+    expect(isValidNotebookName("experiment1")).toBe(true);
+  });
+
+  test("accepts names with hyphens, underscores, dots", () => {
+    expect(isValidNotebookName("my-experiment")).toBe(true);
+    expect(isValidNotebookName("my_experiment")).toBe(true);
+    expect(isValidNotebookName("my.experiment")).toBe(true);
+    expect(isValidNotebookName("v2.1-final_run")).toBe(true);
+  });
+
+  test("rejects empty name", () => {
+    expect(isValidNotebookName("")).toBe(false);
+  });
+
+  test("rejects path traversal", () => {
+    expect(isValidNotebookName("../../../etc/passwd")).toBe(false);
+    expect(isValidNotebookName("..")).toBe(false);
+    expect(isValidNotebookName("foo/../bar")).toBe(false);
+    expect(isValidNotebookName("foo..bar")).toBe(false);
+  });
+
+  test("rejects names starting with dot", () => {
+    expect(isValidNotebookName(".hidden")).toBe(false);
+    expect(isValidNotebookName(".")).toBe(false);
+  });
+
+  test("rejects names with path separators", () => {
+    expect(isValidNotebookName("foo/bar")).toBe(false);
+    expect(isValidNotebookName("foo\\bar")).toBe(false);
+  });
+
+  test("rejects names with spaces or special characters", () => {
+    expect(isValidNotebookName("foo bar")).toBe(false);
+    expect(isValidNotebookName("foo@bar")).toBe(false);
+    expect(isValidNotebookName("foo$bar")).toBe(false);
+  });
+
+  test("rejects names starting with hyphen or underscore", () => {
+    expect(isValidNotebookName("-name")).toBe(false);
+    expect(isValidNotebookName("_name")).toBe(false);
+  });
+});
 
 // ── Path conventions ─────────────────────────────────────────────────────
 
@@ -59,6 +110,13 @@ describe("path conventions", () => {
     expect(cachePath("/project", "training")).toBe(
       "/project/.colab/notebooks/training.ipynb",
     );
+  });
+
+  test("path functions throw on path traversal names", () => {
+    expect(() => contentsPath("../../../etc/passwd")).toThrow("Invalid notebook name");
+    expect(() => localPyPath("/project", "..")).toThrow("Invalid notebook name");
+    expect(() => statePath("/project", "foo/../bar")).toThrow("Invalid notebook name");
+    expect(() => cachePath("/project", ".hidden")).toThrow("Invalid notebook name");
   });
 });
 
@@ -98,7 +156,113 @@ describe("notebook state", () => {
     expect(loaded).toEqual(state);
   });
 
-  test("deleteNotebookState removes state and cache", async () => {
+  test("loadNotebookState migrates legacy gpu field to accelerator + infers variant", async () => {
+    const legacyState = {
+      notebookHash: "abc_def_123..........",
+      endpoint: "gpu-t4-s-test",
+      gpu: "t4",
+      createdAt: new Date().toISOString(),
+    };
+    const { writeJson } = await import("../../src/state/store.ts");
+    const { statePath } = await import("../../src/state/notebooks.ts");
+    await writeJson(statePath(tmpDir, "legacy"), legacyState);
+
+    const loaded = await loadNotebookState(tmpDir, "legacy");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.accelerator).toBe("t4");
+    expect(loaded!.variant).toBe("gpu");
+    expect((loaded as any).gpu).toBeUndefined();
+  });
+
+  test("loadNotebookState migrates legacy gpu=none to accelerator=cpu, variant=cpu", async () => {
+    const legacyState = {
+      notebookHash: "abc_def_123..........",
+      endpoint: "m-s-test",
+      gpu: "none",
+      createdAt: new Date().toISOString(),
+    };
+    const { writeJson } = await import("../../src/state/store.ts");
+    const { statePath } = await import("../../src/state/notebooks.ts");
+    await writeJson(statePath(tmpDir, "legacy-cpu"), legacyState);
+
+    const loaded = await loadNotebookState(tmpDir, "legacy-cpu");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.accelerator).toBe("cpu");
+    expect(loaded!.variant).toBe("cpu");
+  });
+
+  test("loadNotebookState cleans stale gpu field when accelerator exists", async () => {
+    const mixedState = {
+      notebookHash: "abc_def_123..........",
+      endpoint: "gpu-t4-s-test",
+      accelerator: "a100",
+      variant: "gpu",
+      gpu: "t4", // stale leftover
+      createdAt: new Date().toISOString(),
+    };
+    const { writeJson } = await import("../../src/state/store.ts");
+    const { statePath } = await import("../../src/state/notebooks.ts");
+    await writeJson(statePath(tmpDir, "mixed"), mixedState);
+
+    const loaded = await loadNotebookState(tmpDir, "mixed");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.accelerator).toBe("a100"); // accelerator takes precedence
+    expect((loaded as any).gpu).toBeUndefined();
+  });
+
+  test("loadNotebookState handles empty gpu string", async () => {
+    const legacyState = {
+      notebookHash: "abc_def_123..........",
+      endpoint: "m-s-test",
+      gpu: "",
+      createdAt: new Date().toISOString(),
+    };
+    const { writeJson } = await import("../../src/state/store.ts");
+    const { statePath } = await import("../../src/state/notebooks.ts");
+    await writeJson(statePath(tmpDir, "empty-gpu"), legacyState);
+
+    const loaded = await loadNotebookState(tmpDir, "empty-gpu");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.accelerator).toBe("cpu");
+    expect(loaded!.variant).toBe("cpu");
+  });
+
+  test("loadNotebookState infers variant=tpu for TPU accelerator without variant field", async () => {
+    const noVariantState = {
+      notebookHash: "abc_def_123..........",
+      endpoint: "tpu-v5e1-s-test",
+      accelerator: "v5e1",
+      createdAt: new Date().toISOString(),
+    };
+    const { writeJson } = await import("../../src/state/store.ts");
+    const { statePath } = await import("../../src/state/notebooks.ts");
+    await writeJson(statePath(tmpDir, "tpu-no-variant"), noVariantState);
+
+    const loaded = await loadNotebookState(tmpDir, "tpu-no-variant");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.variant).toBe("tpu");
+  });
+
+  test("loadNotebookState does NOT write to disk during migration (no write-on-read)", async () => {
+    const legacyState = {
+      notebookHash: "abc_def_123..........",
+      endpoint: "gpu-t4-s-test",
+      gpu: "t4",
+      createdAt: new Date().toISOString(),
+    };
+    const { writeJson, readJson: rawRead } = await import("../../src/state/store.ts");
+    const { statePath } = await import("../../src/state/notebooks.ts");
+    const path = statePath(tmpDir, "no-write");
+    await writeJson(path, legacyState);
+
+    await loadNotebookState(tmpDir, "no-write");
+
+    // The file on disk should still have the legacy "gpu" field
+    const raw = await rawRead<Record<string, unknown>>(path);
+    expect(raw!.gpu).toBe("t4"); // NOT migrated on disk
+  });
+
+  test("deleteNotebookState removes state but preserves .ipynb cache", async () => {
     await saveNotebookState(tmpDir, "train", makeState());
     // Write a fake cache file
     const cache = cachePath(tmpDir, "train");
@@ -106,6 +270,10 @@ describe("notebook state", () => {
 
     await deleteNotebookState(tmpDir, "train");
     expect(await loadNotebookState(tmpDir, "train")).toBeNull();
+    // Cache should be preserved for reclamation recovery
+    const { stat: fsStat } = await import("fs/promises");
+    const cacheExists = await fsStat(cache).then(() => true, () => false);
+    expect(cacheExists).toBe(true);
   });
 
   test("deleteNotebookState is no-op when not found", async () => {

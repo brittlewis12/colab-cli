@@ -94,10 +94,14 @@ export interface AcceleratorGroup {
   models: string[]; // ["T4", "L4", "A100", ...]
 }
 
-/** GET /v1/user-info response (live-validated 2026-03-11). */
+/** GET /v1/user-info response (live-validated 2026-03-11, consumption fields 2026-03-17). */
 export interface UserInfo {
   subscriptionTier: string; // "SUBSCRIPTION_TIER_PRO", etc.
   paidComputeUnitsBalance?: number;
+  /** Current compute unit burn rate across all active runtimes (units/hour). */
+  consumptionRateHourly?: number;
+  /** Number of active runtime assignments. */
+  assignmentsCount?: number;
   eligibleAccelerators?: AcceleratorGroup[];
   ineligibleAccelerators?: AcceleratorGroup[];
 }

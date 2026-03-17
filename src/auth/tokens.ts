@@ -9,7 +9,7 @@
  * overriding paths and fetch (for testing).
  */
 
-import { mkdir, readFile, writeFile, unlink, chmod } from "fs/promises";
+import { mkdir, readFile, writeFile, unlink, chmod, rename } from "fs/promises";
 import { dirname, join } from "path";
 import { homedir } from "os";
 import {
@@ -49,9 +49,9 @@ export interface TokenOptions {
 const CONFIG_DIR = join(homedir(), ".config", "colab-cli");
 const DEFAULT_CREDENTIALS_PATH = join(CONFIG_DIR, "credentials.json");
 
-/** Get the credentials file path, respecting overrides. */
+/** Get the credentials file path, respecting overrides and COLAB_CREDENTIALS_PATH env var. */
 export function getCredentialsPath(opts?: TokenOptions): string {
-  return opts?.credentialsPath ?? DEFAULT_CREDENTIALS_PATH;
+  return opts?.credentialsPath ?? process.env.COLAB_CREDENTIALS_PATH ?? DEFAULT_CREDENTIALS_PATH;
 }
 
 // ── Persistence ──────────────────────────────────────────────────────────
@@ -72,15 +72,17 @@ export async function loadCredentials(
   }
 }
 
-/** Save credentials to disk with mode 0600. */
+/** Save credentials to disk with mode 0600 (atomic write to prevent race). */
 export async function saveCredentials(
   creds: StoredCredentials,
   opts?: TokenOptions,
 ): Promise<void> {
   const path = getCredentialsPath(opts);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(creds, null, 2), "utf-8");
-  await chmod(path, 0o600);
+  // Write to .tmp then rename — prevents a window where the file exists with default umask
+  const tmp = path + ".tmp";
+  await writeFile(tmp, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  await rename(tmp, path);
 }
 
 /** Delete credentials file. */

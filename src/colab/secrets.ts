@@ -17,20 +17,37 @@ export function createSecretResolver(
   client: ColabClient,
   accessToken: string,
 ): SecretResolver {
-  let cache: Map<string, string> | null = null;
+  // Promise-based cache prevents double-fetch on concurrent calls.
+  // On success, the map is cached for the session lifetime.
+  // On failure, the cache is cleared so the next call retries — and the
+  // failed promise itself rejects, so in-flight callers also see the failure
+  // and can retry on their next invocation.
+  let cachePromise: Promise<Map<string, string>> | null = null;
+
+  async function fetchSecrets(): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    const secrets = await client.listSecrets(accessToken);
+    for (const s of secrets) {
+      map.set(s.key, s.payload);
+    }
+    return map;
+  }
 
   return async (key: string) => {
-    // Lazy-load on first request
-    if (!cache) {
-      cache = new Map();
-      try {
-        const secrets = await client.listSecrets(accessToken);
-        for (const s of secrets) {
-          cache.set(s.key, s.payload);
-        }
-      } catch {
-        // If API fails, cache stays empty — env vars still work
-      }
+    if (!cachePromise) {
+      cachePromise = fetchSecrets().catch((err) => {
+        // Clear cache so next call retries (don't poison permanently)
+        cachePromise = null;
+        throw err;
+      });
+    }
+
+    let cache: Map<string, string>;
+    try {
+      cache = await cachePromise;
+    } catch {
+      // API failed — fall through to "not found" (env vars still work)
+      return { exists: false as const };
     }
 
     const payload = cache.get(key);

@@ -68,6 +68,21 @@ function parseMarkerOptions(optionsStr: string): {
   }
 
   const metadata = parseMetadataString(rest);
+
+  // For code cells, if the first token in the options is a bare identifier
+  // (starts with a letter/digit/underscore, no `=`), it's a cell title.
+  // `# %% data_prep` → title is "data_prep". Store it in metadata.title for
+  // cell addressing via `run --cell data_prep`. The bare key is also kept in
+  // metadata for round-trip compatibility (jupytext uses { data_prep: null }).
+  // Tokens starting with `.` or other special chars (e.g., `.class`) are CSS
+  // class annotations, not titles.
+  if (cellType === "code" && rest) {
+    const firstToken = rest.split(/\s/)[0]!;
+    if (firstToken && !firstToken.includes("=") && /^\w/.test(firstToken)) {
+      metadata.title = firstToken;
+    }
+  }
+
   return { cellType, metadata };
 }
 

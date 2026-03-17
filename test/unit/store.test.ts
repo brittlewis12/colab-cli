@@ -22,7 +22,9 @@ describe("readJson", () => {
   test("parses JSON file", async () => {
     const path = join(tmpDir, "data.json");
     await Bun.write(path, '{"x":1}');
-    expect(await readJson(path)).toEqual({ x: 1 });
+    const result = await readJson<{ x: number }>(path);
+    expect(result).not.toBeNull();
+    expect(result!).toEqual({ x: 1 });
   });
 });
 
@@ -38,7 +40,9 @@ describe("writeJson", () => {
   test("creates parent directories", async () => {
     const path = join(tmpDir, "nested", "deep", "out.json");
     await writeJson(path, { ok: true });
-    expect(await readJson(path)).toEqual({ ok: true });
+    const result = await readJson<{ ok: boolean }>(path);
+    expect(result).not.toBeNull();
+    expect(result!).toEqual({ ok: true });
   });
 
   test("atomic: .tmp file does not persist", async () => {
@@ -58,7 +62,9 @@ describe("writeJson", () => {
     const path = join(tmpDir, "over.json");
     await writeJson(path, { v: 1 });
     await writeJson(path, { v: 2 });
-    expect(await readJson(path)).toEqual({ v: 2 });
+    const result2 = await readJson<{ v: number }>(path);
+    expect(result2).not.toBeNull();
+    expect(result2!).toEqual({ v: 2 });
   });
 });
 

@@ -12,6 +12,7 @@ import {
   findProjectRoot,
   loadNotebookState,
   deleteNotebookState,
+  isValidNotebookName,
 } from "../state/notebooks.ts";
 
 export async function killCommand(
@@ -20,6 +21,9 @@ export async function killCommand(
   const name = args[0];
   if (!name) {
     return err("kill", "USAGE", "Missing notebook name", "Usage: colab kill <name>");
+  }
+  if (!isValidNotebookName(name)) {
+    return err("kill", "USAGE", `Invalid notebook name: "${name}". Names must start with a letter or digit and contain only alphanumerics, hyphens, underscores, and dots.`);
   }
 
   const projectRoot = await findProjectRoot();
@@ -34,9 +38,13 @@ export async function killCommand(
   try {
     token = await getAccessToken();
   } catch {
-    // Even without auth, clean up local state
-    await deleteNotebookState(projectRoot, name);
-    return ok("kill", { name, unassigned: false, stateDeleted: true });
+    // Can't unassign without auth — warn but don't delete state (runtime may still be burning compute)
+    return err(
+      "kill",
+      "AUTH",
+      `Not authenticated — cannot release runtime for "${name}"`,
+      `Run: colab auth login  # then retry: colab kill ${name}`,
+    );
   }
 
   // Unassign runtime
@@ -48,10 +56,11 @@ export async function killCommand(
     streamErr(`Runtime ${state.endpoint} released.`);
   } catch (e) {
     streamErr(`Could not unassign runtime: ${e}`);
-    // Non-fatal — runtime may already be dead
+    // Runtime may already be dead — still safe to clean up state
   }
 
-  // Clean up local state
+  // Only delete state after unassign attempt (regardless of success —
+  // if unassign failed, the runtime was likely already dead)
   await deleteNotebookState(projectRoot, name);
 
   return ok("kill", { name, unassigned, stateDeleted: true });

@@ -31,11 +31,11 @@ describe("parseXssiJson", () => {
   });
 
   test("handles empty object", () => {
-    expect(parseXssiJson(")]}'\n{}")).toEqual({});
+    expect(parseXssiJson<Record<string, unknown>>(")]}'\n{}")).toEqual({});
   });
 
   test("handles array response", () => {
-    expect(parseXssiJson(")]}'\n[1,2,3]")).toEqual([1, 2, 3]);
+    expect(parseXssiJson<number[]>(")]}'\n[1,2,3]")).toEqual([1, 2, 3]);
   });
 
   test("throws on invalid JSON after prefix", () => {
