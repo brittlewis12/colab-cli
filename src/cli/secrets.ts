@@ -47,14 +47,21 @@ async function secretsList(): Promise<CommandResult<SecretsListData>> {
   }
 
   const client = new ColabClient();
-  let secrets: Array<{ key: string }>;
+  let secrets: unknown;
   try {
     secrets = await client.listSecrets(token);
   } catch (e) {
     return err("secrets.list", "ERROR", `Could not fetch secrets: ${e}`);
   }
 
-  // Return key names only — never expose payloads
-  const keys = secrets.map((s) => s.key);
+  // API returns either an array of {key, payload} or an object keyed by name
+  let keys: string[];
+  if (Array.isArray(secrets)) {
+    keys = secrets.map((s: { key: string }) => s.key);
+  } else if (secrets && typeof secrets === "object") {
+    keys = Object.keys(secrets);
+  } else {
+    keys = [];
+  }
   return ok("secrets.list", { keys });
 }

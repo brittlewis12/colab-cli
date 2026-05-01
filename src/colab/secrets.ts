@@ -27,8 +27,15 @@ export function createSecretResolver(
   async function fetchSecrets(): Promise<Map<string, string>> {
     const map = new Map<string, string>();
     const secrets = await client.listSecrets(accessToken);
-    for (const s of secrets) {
-      map.set(s.key, s.payload);
+    // API returns either an array of {key, payload} or an object keyed by name
+    if (Array.isArray(secrets)) {
+      for (const s of secrets) {
+        map.set(s.key, s.payload);
+      }
+    } else if (secrets && typeof secrets === "object") {
+      for (const [key, val] of Object.entries(secrets as Record<string, { payload: string }>)) {
+        map.set(key, val.payload);
+      }
     }
     return map;
   }
