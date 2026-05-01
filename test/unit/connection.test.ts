@@ -422,8 +422,8 @@ describe("KernelConnection", () => {
       // Should have sent a reply
       expect(ws.sent).toHaveLength(1);
       const reply = JSON.parse(ws.sent[0]!);
-      expect(reply.content.value.exists).toBe(true);
-      expect(reply.content.value.payload).toBe("env-value");
+      expect(reply.content.value.data.exists).toBe(true);
+      expect(reply.content.value.data.payload).toBe("env-value");
       expect(reply.content.value.colab_msg_id).toBe(42);
 
       conn.close();
@@ -461,8 +461,8 @@ describe("KernelConnection", () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const reply = JSON.parse(ws.sent[0]!);
-    expect(reply.content.value.exists).toBe(true);
-    expect(reply.content.value.payload).toBe("api_value");
+    expect(reply.content.value.data.exists).toBe(true);
+    expect(reply.content.value.data.payload).toBe("api_value");
 
     conn.close();
   });
@@ -493,7 +493,7 @@ describe("KernelConnection", () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const reply = JSON.parse(ws.sent[0]!);
-    expect(reply.content.value.exists).toBe(false);
+    expect(reply.content.value.data.exists).toBe(false);
 
     conn.close();
   });

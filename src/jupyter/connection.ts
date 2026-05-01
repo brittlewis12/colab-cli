@@ -387,9 +387,9 @@ export class KernelConnection {
     const value: Record<string, unknown> = {
       type: "colab_reply",
       colab_msg_id: colabMsgId,
-      ...(exists
+      data: exists
         ? { exists: true, access: true, payload: payload ?? "" }
-        : { exists: false }),
+        : { exists: false },
     };
 
     const reply: JupyterMessage = {
